@@ -18,8 +18,8 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     Prepare data for link prediction pipeline.
 
     This function loads a graph from a file, splits it into training and testing sets,
-    converts node labels to integers, saves the resulting training graph in the root folder, 
-    and outputs negative training edges, negative test edges, and positive test edges.
+    saves the resulting training graph in the root folder, and outputs negative training edges, 
+    negative test edges, and positive test edges.
 
     Parameters:
     fpath (str): Path to the graph file.
@@ -91,9 +91,6 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     largest_cc = max(nx.connected_components(G), key=len)
     G = G.subgraph(largest_cc).copy()
 
-    G = nx.convert_node_labels_to_integers(
-        G, label_attribute='orig')
-
     G_train, test_edges, test_non_edges, train_non_edges = split(G)
 
     # error handling
@@ -132,7 +129,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, mode='P
     Returns:
     dict: Dictionary with AUC scores for each operator ('avg', 'hadamard', 'w-l1', 'w-l2').
     dict: Dictionary of embeddings for each node.
-    nx.Graph: Graph object created from file.
     """
     # unpacking kwargs
     p = kwargs.get('p', 1)
@@ -324,4 +320,4 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, mode='P
     for op, score in results.items():
         print(f"{op:10}: {score:.4f}")
 
-    return results, embedding_map, G_train
+    return results, embedding_map
