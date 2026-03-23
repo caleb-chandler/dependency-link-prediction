@@ -5,47 +5,32 @@ from pecanpy import pecanpy as n2v
 from pecanpy.graph import AdjlstGraph
 import random
 from sklearn.linear_model import LogisticRegression
-import ast
-import pickle
 from sklearn.metrics import roc_auc_score
 from scipy.io import loadmat
 import scipy.sparse as sp
-from gensim.models import Word2Vec
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
 
-def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
+def prepare_data(fpath, ftype=None, frac=0.5):
     """
-    Run the complete link prediction pipeline.
+    Prepare data for link prediction pipeline.
 
     This function loads a graph from a file, splits it into training and testing sets,
-    generates node embeddings using node2vec, trains logistic regression classifiers
-    on different edge embedding operators, and evaluates them on the test set.
+    converts node labels to integers, saves the resulting training graph in the root folder, 
+    and outputs negative training edges, negative test edges, and positive test edges.
 
     Parameters:
     fpath (str): Path to the graph file.
     ftype (str): Type of the file ('mat' for MATLAB format, else default to edgelist).
     frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
-    mode (str, optional): Mode for PecanPy walk-probability computation. Default is PreComp.
-    **kwargs: Hyperparameter settings.
 
     Returns:
-    dict: Dictionary with AUC scores for each operator ('avg', 'hadamard', 'w-l1', 'w-l2').
-    dict: Dictionary of embeddings for each node.
-    G: Graph object created from file.
+    list : list of negative training samples
+    list : list of positive testing samples
+    list : list of negative testing samples
     """
-    # unpacking kwargs
-    p = kwargs.get('p', 1)
-    q = kwargs.get('q', 1)
-    workers = kwargs.get('workers', 4)
-    verbose = kwargs.get('verbose', True)
-    vector_size = kwargs.get('vector_size', 128)
-    window = kwargs.get('window', 10)
-    min_count = kwargs.get('min_count', 0)
-    sg = kwargs.get('sg', 1)
-    epochs = kwargs.get('epochs', 1)
 
     def split(G, frac=frac):
         edges = list(G.edges())
@@ -56,7 +41,7 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
 
         # sample test edges from removable edges only (make sure count isnt larger thatn removable_edges)
         test_count = min(int(len(edges) * frac), len(removable_edges))
-        test_edges = set(random.sample(removable_edges, test_count))
+        test_edges = list(random.sample(removable_edges, test_count))
         train_edges = [e for e in edges if e not in test_edges]
 
         # build training graph
@@ -122,6 +107,49 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
+    return train_non_edges, test_edges, test_non_edges
+
+
+def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, mode='PreComp', **kwargs):
+    """
+    Run the complete link prediction pipeline.
+
+    This function takes a path to a training graph, a set of negative training edges, 
+    and a set of positive/negative testing edges, and outputs a set of AUC scores 
+    for four binary operators.
+
+    Generates node embeddings using node2vec, trains logistic regression classifiers
+    on different edge embedding operators, and evaluates them on the test set.
+
+    Parameters:
+    trainfile (str): Path to the training graph file.
+    train_non_edges (list) : Negative training edges.
+    test_edges (list) : Positive testing edges.
+    test_non_edges (list) : Negative testing edges.
+    mode (str, optional): Mode for PecanPy walk-probability computation. Default is PreComp.
+    **kwargs: Hyperparameter settings (see PecanPy documentation).
+
+    Returns:
+    dict: Dictionary with AUC scores for each operator ('avg', 'hadamard', 'w-l1', 'w-l2').
+    dict: Dictionary of embeddings for each node.
+    nx.Graph: Graph object created from file.
+    """
+    # unpacking kwargs
+    p = kwargs.get('p', 1)
+    q = kwargs.get('q', 1)
+    workers = kwargs.get('workers', 4)
+    verbose = kwargs.get('verbose', True)
+    dim = kwargs.get('dim', 128)
+    num_walks = kwargs.get('num_walks', 10)
+    walk_length = kwargs.get('walk_length', 80)
+    window_size = kwargs.get('window_size', 10)
+    min_count = kwargs.get('min_count', 0)
+    sg = kwargs.get('sg', 1)
+    epochs = kwargs.get('epochs', 1)
+
+    # converting training graph to nx.Graph object
+    G_train = nx.read_edgelist(trainfile)
+
     # ===== Generating Embeddings =====
 
     def make_pecanpy_graph(chosen_mode):
@@ -134,6 +162,7 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
         else:
             raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
 
+    # get walk sequences + embeddings; fall back to other modes if needed
     tried_modes = [mode]
     if mode != 'PreComp':
         tried_modes.append('PreComp')
@@ -146,8 +175,22 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
             g = make_pecanpy_graph(candidate_mode)
             g.read_edg('train.txt', weighted=False,
                        directed=False, delimiter=' ')
-            g.preprocess_transition_probs()
-            walks = g.simulate_walks(num_walks=10, walk_length=80)
+
+            # preprocess for PreComp
+            if candidate_mode == 'PreComp':
+                g.preprocess_transition_probs()
+
+            # main call (combines walk simulation and embedding generation)
+            embeddings = g.embed(
+                dim=dim,
+                num_walks=num_walks,
+                walk_length=walk_length,
+                window_size=window_size,
+                epochs=epochs,
+                workers=workers,
+                verbose=verbose
+            )
+
             if candidate_mode != mode:
                 print(
                     f"Warning: requested mode '{mode}' failed, fell back to '{candidate_mode}'")
@@ -161,21 +204,19 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
             f"Pecanpy walk generation failed for all modes: {tried_modes}"
         ) from last_exception
 
-    # train embeddings using word2vec from gensim for more control
-    model = Word2Vec(walks, vector_size=vector_size, window=window, min_count=min_count,
-                     sg=sg, workers=workers, epochs=epochs)
-
     # ===== Training =====
 
     embedding_map = {}
-    for node in model.wv.index_to_key:
-        if node is None:
+    for i, node_id in enumerate(g.nodes):
+        if node_id is None:
             continue
         try:
-            key = int(node)
+            # handle integer keys
+            key = int(node_id)
         except (ValueError, TypeError):
-            key = node
-        embedding_map[key] = model.wv[node].tolist()
+            key = node_id
+
+        embedding_map[key] = embeddings[i].tolist()
 
     print("Sample embeddings keys type:", type(
         next(iter(embedding_map.keys()))))
@@ -283,4 +324,4 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
     for op, score in results.items():
         print(f"{op:10}: {score:.4f}")
 
-    return results, embedding_map, G
+    return results, embedding_map, G_train
