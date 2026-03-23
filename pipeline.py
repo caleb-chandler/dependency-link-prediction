@@ -33,6 +33,8 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
 
     Returns:
     dict: Dictionary with AUC scores for each operator ('avg', 'hadamard', 'w-l1', 'w-l2').
+    dict: Dictionary of embeddings for each node.
+    G: Graph object created from file.
     """
     # unpacking kwargs
     p = kwargs.get('p', 1)
@@ -281,4 +283,4 @@ def run_pipeline(fpath, ftype=None, frac=0.5, mode='PreComp', **kwargs):
     for op, score in results.items():
         print(f"{op:10}: {score:.4f}")
 
-    return results
+    return results, embedding_map, G
