@@ -33,16 +33,15 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     """
 
     def split(G, frac=frac):
-        edges = list(G.edges())
+        # load edges as sorted tuples for efficiency
+        edges = {tuple(sorted(e)) for e in G.edges()}
+        mst = {tuple(sorted(e)) for e in nx.minimum_spanning_tree(G).edges()}
 
-        # guarantee fully connected training set by protecting spanning tree from removal
-        spanning_tree_edges = set(nx.minimum_spanning_tree(G).edges())
-        removable_edges = [e for e in edges if e not in spanning_tree_edges]
-
-        # sample test edges from removable edges only (make sure count isnt larger thatn removable_edges)
+        # fast set difference
+        removable_edges = list(edges - mst)
         test_count = min(int(len(edges) * frac), len(removable_edges))
-        test_edges = list(random.sample(removable_edges, test_count))
-        train_edges = [e for e in edges if e not in test_edges]
+        test_edges = random.sample(removable_edges, test_count)
+        train_edges = list(edges - set(test_edges))
 
         # build training graph
         G_train = nx.Graph()
