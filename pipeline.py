@@ -98,7 +98,6 @@ def prepare_data(fpath, ftype=None, frac=0.5):
         return None
 
     # saving training graph
-    print("About to write training graph...")
     nx.write_edgelist(G_train, 'train.txt', data=False)
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
@@ -182,7 +181,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, mode='P
                 walk_length=walk_length,
                 window_size=window_size,
                 epochs=epochs,
-                workers=workers,
                 verbose=verbose
             )
 
