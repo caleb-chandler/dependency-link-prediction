@@ -9,6 +9,96 @@ from scipy.io import loadmat
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
+from collections import Counter
+
+
+def load(fpath, ftype):
+    if ftype == 'mat':
+        edgelist = loadmat(fpath)
+        adj_matrix = edgelist['network']
+        G = nx.from_scipy_sparse_array(adj_matrix)
+        print(f"Nodes: {G.number_of_nodes()}")
+        print(f"Edges: {G.number_of_edges()}")
+    else:
+        df = pd.read_csv(fpath, sep='\s+', names=['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
+                                                  'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
+                                                  'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
+                                                  'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP'])
+        G = nx.from_pandas_edgelist(
+            df,
+            source='ORIGIN',
+            target='DESTINATION',
+            edge_attr=['N_COVISITS', 'DIST_KM', 'DEP'],
+        )
+        # assign node attrs
+        origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
+                      'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
+        origins.columns = ['node_id', 'lat', 'lng',
+                           'taxonomy', 'unique_visits', 'total_visits']
+        destinations = df[['DESTINATION', 'LAT_DESTINATION',
+                           'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
+                           'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
+        destinations.columns = ['node_id', 'lat', 'lng',
+                                'taxonomy', 'unique_visits', 'total_visits']
+
+        # combine them into one master list of unique POIs
+        node_data = pd.concat([origins, destinations]).drop_duplicates(
+            'node_id').set_index('node_id')
+
+        # map back to graph - convert to dict and apply
+        lat_dict = node_data['lat'].to_dict()
+        lng_dict = node_data['lng'].to_dict()
+        tax_dict = node_data['taxonomy'].to_dict()
+        uv_dict = node_data['unique_visits'].to_dict()
+        tv_dict = node_data['total_visits'].to_dict()
+        nx.set_node_attributes(G, lat_dict, 'latitude')
+        nx.set_node_attributes(G, lng_dict, 'longitude')
+        nx.set_node_attributes(G, tax_dict, 'poi_type')
+        nx.set_node_attributes(G, uv_dict, 'unique_visits')
+        nx.set_node_attributes(G, tv_dict, 'total_visits')
+
+        # verification
+        print(f"Attribute check: {random.choice(list(G.nodes))}")
+
+        print(f"Nodes: {G.number_of_nodes()}")
+        print(f"Edges: {G.number_of_edges()}")
+    return G
+
+
+def distribution_finder(G):
+    # --- distance ---
+    all_distances = list(nx.get_edge_attributes(G, 'DIST_KM').values())
+    d_counts, d_edges = np.histogram(all_distances, bins=30)
+    # Simplified labels for math
+    dist_distr = pd.Series(d_counts, index=d_edges[:-1])
+
+    # --- covisits ---
+    all_covisits = [data['N_COVISITS']
+                    for u, v, data in G.edges(data=True)]
+    cv_counts, cv_edges = np.histogram(all_covisits, bins=30)
+    cv_distr = dist_distr = pd.Series(cv_counts, index=cv_edges[:-1])
+
+    # --- POI type ---
+    all_types = [data.get('poi_type', 'Unknown')
+                 for u, data in G.nodes(data=True)]
+    type_distr = pd.Series(all_types).value_counts().sort_index()
+
+    # --- visits (unique + total) ---
+    all_u_visits = [data.get('unique_visits', 0)
+                    for u, data in G.nodes(data=True)]
+    uv_counts, uv_edges = np.histogram(all_u_visits, bins=30)
+    uv_distr = pd.Series(uv_counts, index=uv_edges[:-1])
+
+    all_t_visits = [data.get('total_visits', 0)
+                    for u, data in G.nodes(data=True)]
+    tv_counts, tv_edges = np.histogram(all_t_visits, bins=30)
+    tv_distr = pd.Series(tv_counts, index=tv_edges[:-1])
+
+    # --- TOPOLOGY: Degree (Discrete) ---
+    deg_counts = Counter(dict(G.degree()).values())
+    deg_distr = pd.Series(deg_counts).sort_index()
+
+    return dist_distr, cv_distr, type_distr, uv_distr, tv_distr, deg_distr
 
 
 def prepare_data(fpath, ftype=None, frac=0.5):
@@ -16,7 +106,7 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     Prepare data for link prediction pipeline.
 
     This function loads a graph from a file, splits it into training and testing sets,
-    saves the resulting training graph in the root folder, and outputs negative training edges, 
+    saves the resulting training graph in the root folder, and outputs negative training edges,
     negative test edges, and positive test edges.
 
     Parameters:
@@ -29,10 +119,6 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     list : list of positive testing samples
     list : list of negative testing samples
     """
-
-    # function to find the feature distributions of the edges
-    def distribution_finder(G):
-        edges = list(G.edges())
 
     def split(G, frac=frac):
         # load edges as sorted tuples for efficiency
@@ -69,55 +155,6 @@ def prepare_data(fpath, ftype=None, frac=0.5):
         train_non_edges = sample_non_edges(G, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
-
-    def load(fpath, ftype):
-        if ftype == 'mat':
-            edgelist = loadmat(fpath)
-            adj_matrix = edgelist['network']
-            G = nx.from_scipy_sparse_array(adj_matrix)
-            print(f"Nodes: {G.number_of_nodes()}")
-            print(f"Edges: {G.number_of_edges()}")
-        else:
-            df = pd.read_csv(fpath)
-            G = nx.from_pandas_edgelist(
-                df,
-                source='ORIGIN',
-                target='DESTINATION',
-                edge_attr=['N_COVISITS', 'DIST_KM', 'DEP'],
-            )
-            # assign node attrs
-            origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
-                          'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
-            origins.columns = ['node_id', 'lat', 'lng',
-                               'taxonomy', 'unique_visits', 'total_visits']
-            destinations = df[['DESTINATION', 'LAT_DESTINATION',
-                               'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
-                               'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
-            destinations.columns = ['node_id', 'lat', 'lng',
-                                    'taxonomy', 'unique_visits', 'total_visits']
-
-            # combine them into one master list of unique POIs
-            node_data = pd.concat([origins, destinations]).drop_duplicates(
-                'node_id').set_index('node_id')
-
-            # map back to graph - convert to dict and apply
-            lat_dict = node_data['lat'].to_dict()
-            lng_dict = node_data['lng'].to_dict()
-            tax_dict = node_data['taxonomy'].to_dict()
-            uv_dict = node_data['unique_visits'].to_dict()
-            tv_dict = node_data['total_visits'].to_dict()
-            nx.set_node_attributes(G, lat_dict, 'latitude')
-            nx.set_node_attributes(G, lng_dict, 'longitude')
-            nx.set_node_attributes(G, tax_dict, 'poi_type')
-            nx.set_node_attributes(G, uv_dict, 'unique_visits')
-            nx.set_node_attributes(G, tv_dict, 'total_visits')
-
-            # verification
-            print(f"Attribute check: {G.nodes[21]}")
-
-            print(f"Nodes: {G.number_of_nodes()}")
-            print(f"Edges: {G.number_of_edges()}")
-        return G
 
     G = load(fpath, ftype)
 
