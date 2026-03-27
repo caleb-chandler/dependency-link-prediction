@@ -66,39 +66,77 @@ def load(fpath, ftype):
 
 
 def distribution_finder(G):
-    # --- distance ---
-    all_distances = list(nx.get_edge_attributes(G, 'DIST_KM').values())
-    d_counts, d_edges = np.histogram(all_distances, bins=30)
-    # Simplified labels for math
-    dist_distr = pd.Series(d_counts, index=d_edges[:-1])
+    # --- HELPER 1: For continuous data (bins) ---
+    def get_binned_dist(data_dict, bins=30):
+        if not data_dict:
+            return pd.Series(dtype='float64'), {}
 
-    # --- covisits ---
-    all_covisits = [data['N_COVISITS']
-                    for u, v, data in G.edges(data=True)]
-    cv_counts, cv_edges = np.histogram(all_covisits, bins=30)
-    cv_distr = dist_distr = pd.Series(cv_counts, index=cv_edges[:-1])
+        # Convert dict to series. Index = Node ID or Edge Tuple, Value = Attribute
+        s = pd.Series(data_dict).dropna()
 
-    # --- POI type ---
-    all_types = [data.get('poi_type', 'Unknown')
-                 for u, data in G.nodes(data=True)]
-    type_distr = pd.Series(all_types).value_counts().sort_index()
+        # Calculate histogram and bins
+        counts, edges = np.histogram(s, bins=bins)
+        distr = pd.Series(counts, index=edges[:-1])
 
-    # --- visits (unique + total) ---
-    all_u_visits = [data.get('unique_visits', 0)
-                    for u, data in G.nodes(data=True)]
-    uv_counts, uv_edges = np.histogram(all_u_visits, bins=30)
-    uv_distr = pd.Series(uv_counts, index=uv_edges[:-1])
+        # Cut the data into the exact same bins and group them
+        binned = pd.cut(s, bins=edges, include_lowest=True)
 
-    all_t_visits = [data.get('total_visits', 0)
-                    for u, data in G.nodes(data=True)]
-    tv_counts, tv_edges = np.histogram(all_t_visits, bins=30)
-    tv_distr = pd.Series(tv_counts, index=tv_edges[:-1])
+        # Group by the bin intervals and extract the IDs as a set
+        # This creates a dictionary: {Interval(...): {node1, node2, ...}}
+        elements_by_bin = s.groupby(binned, observed=False).apply(
+            lambda x: set(x.index)).to_dict()
+
+        return distr, elements_by_bin
+
+    # --- HELPER 2: For discrete/categorical data ---
+    def get_discrete_dist(data_dict):
+        if not data_dict:
+            return pd.Series(dtype='float64'), {}
+
+        s = pd.Series(data_dict)
+        distr = s.value_counts().sort_index()
+
+        # Group exactly by the value
+        elements_by_val = s.groupby(s).apply(lambda x: set(x.index)).to_dict()
+
+        return distr, elements_by_val
+
+    # ---------------------------------------------------------
+
+    # --- EDGES: Distance (Continuous) ---
+    dist_dict = nx.get_edge_attributes(G, 'DIST_KM')
+    dist_distr, dist_edges_set = get_binned_dist(dist_dict, bins=30)
+
+    # --- EDGES: Covisits (Continuous/Discrete) ---
+    cv_dict = nx.get_edge_attributes(G, 'N_COVISITS')
+    cv_distr, cv_edges_set = get_binned_dist(cv_dict, bins=30)
+
+    # --- NODES: Categorical (POI Type) ---
+    type_dict = {u: data.get('poi_type', 'Unknown')
+                 for u, data in G.nodes(data=True)}
+    type_distr, type_nodes_set = get_discrete_dist(type_dict)
+
+    # --- NODES: Unique Visits (Continuous) ---
+    uv_dict = {u: data.get('unique_visits', 0)
+               for u, data in G.nodes(data=True)}
+    uv_distr, uv_nodes_set = get_binned_dist(uv_dict, bins=30)
+
+    # --- NODES: Total Visits (Continuous) ---
+    tv_dict = {u: data.get('total_visits', 0)
+               for u, data in G.nodes(data=True)}
+    tv_distr, tv_nodes_set = get_binned_dist(tv_dict, bins=30)
 
     # --- TOPOLOGY: Degree (Discrete) ---
-    deg_counts = Counter(dict(G.degree()).values())
-    deg_distr = pd.Series(deg_counts).sort_index()
+    deg_dict = dict(G.degree())
+    deg_distr, deg_nodes_set = get_discrete_dist(deg_dict)
 
-    return dist_distr, cv_distr, type_distr, uv_distr, tv_distr, deg_distr
+    # Pack the results logically so it's easy to return
+    distributions = (dist_distr, cv_distr, type_distr,
+                     uv_distr, tv_distr, deg_distr)
+    element_sets = (dist_edges_set, cv_edges_set, type_nodes_set,
+                    uv_nodes_set, tv_nodes_set, deg_nodes_set)
+
+    return distributions, element_sets
 
 
 def prepare_data(fpath, ftype=None, frac=0.5):
@@ -136,23 +174,55 @@ def prepare_data(fpath, ftype=None, frac=0.5):
         G_train.add_nodes_from(G.nodes())
         G_train.add_edges_from(train_edges)
 
-        # function to restrict sampled non-edges for better performance on large datasets
+        # sample non-edges by bin to preserve distribution
+        distrs, sets = distribution_finder(G)
+        dist_bins = sets[0]  # distance dict
 
-        # todo: add distribution_finder as internal function
-        def sample_non_edges(G, count):
+        def sample_non_edges(G, bins_dict, total_count):
             non_edges = set()
-            nodes = list(G.nodes())
-            with tqdm(total=count, desc='sampling non-edges', unit='edge', leave=False) as pbar:
-                while len(non_edges) < count:
-                    u, v = sorted(random.sample(nodes, 2))
-                    if not G.has_edge(u, v) and (u, v) not in non_edges:
-                        non_edges.add((u, v))
-                        pbar.update(1)
+
+            # calculate the total number of items across all bins to find proportions
+            total_elements = sum(len(elements)
+                                 for elements in bins_dict.values())
+
+            with tqdm(total=total_count, desc='sampling non-edges', unit='edge', leave=False) as pbar:
+                for bin, elements in bins_dict.items():
+                    if len(elements) < 2:
+                        continue  # need at least 2 nodes
+
+                    # calculate how many non-edges to take from this specific bin
+                    bin_proportion = len(elements) / total_elements
+                    num_samples_for_this_bin = int(
+                        bin_proportion * total_count)
+
+                    # sample until this bin's quota is met
+                    bin_samples = 0
+                    # don't try to sample more than possible pairs in the bin
+                    max_possible = (len(elements) * (len(elements) - 1)) // 2
+                    quota = min(num_samples_for_this_bin, max_possible)
+
+                    # convert set to list once for faster random.sample
+                    node_list = list(elements)
+
+                    while bin_samples < quota:
+                        u, v = random.sample(node_list, 2)
+                        if u > v:
+                            u, v = v, u  # keep edges sorted (u, v)
+
+                        if not G.has_edge(u, v) and (u, v) not in non_edges:
+                            non_edges.add((u, v))
+                            bin_samples += 1
+                            pbar.update(1)
+
+                            # stop if we hit the global count early due to rounding
+                            if len(non_edges) >= total_count:
+                                return list(non_edges)
+
             return list(non_edges)
 
         # getting true negatives (overlap possible but very improbable for large datasets)
-        test_non_edges = sample_non_edges(G, len(test_edges))
-        train_non_edges = sample_non_edges(G, len(train_edges))
+        test_non_edges = sample_non_edges(G, dist_bins, len(test_edges))
+        train_non_edges = sample_non_edges(G, dist_bins, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
