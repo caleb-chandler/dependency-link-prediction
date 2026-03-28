@@ -60,21 +60,26 @@ def load(fpath):
 # ================================================================
 
 
-def distribution_finder(G):
+def distribution_finder(G, bins=50):
     # --- helper: continuous data (bins ---)
-    def get_binned_dist(data_dict, bins=30):
+    def get_binned_dist(data_dict, bins):
         if not data_dict:
             return pd.Series(dtype='float64'), {}
 
         # convert dict to series. index = node id or edge tuple, value = attribute
         s = pd.Series(data_dict).dropna()
 
-        # calculate histogram and bins
-        counts, bin_edges = np.histogram(s, bins=bins)
-        distr = pd.Series(counts, index=bin_edges[:-1])
+        # if bins is an integer, let numpy calculate linear edges. otherwise, use custom edges.
+        if isinstance(bins, int):
+            _, bin_edges = np.histogram(s, bins=bins)
+        else:
+            bin_edges = bins
 
-        # Cut the data into the exact same bins and group them
+        # cut the data into bins. this returns true interval objects
         binned = pd.cut(s, bins=bin_edges, include_lowest=True)
+
+        # The distribution is the count of edges in each Interval
+        distr = binned.value_counts().sort_index()
 
         # group by the bin intervals and extract the ids as a set
         # this creates an interval:nodes dict
@@ -98,11 +103,21 @@ def distribution_finder(G):
 
     # --- edges: distance (continuous) ---
     dist_dict = nx.get_edge_attributes(G, 'DIST_KM')
-    dist_distr, dist_edges_set = get_binned_dist(dist_dict, bins=30)
+    if dist_dict:
+        max_d = max(dist_dict.values())
+        if max_d > 0.01:
+            # Create logarithmic bins: start with 0, then exponentially space from 0.01km (10m) to max_d
+            custom_bins = np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
+        else:
+            custom_bins = np.linspace(0, max_d + 1e-5, 50)
+    else:
+        custom_bins = bins
+
+    dist_distr, dist_edges_set = get_binned_dist(dist_dict, custom_bins)
 
     # --- edges: covisits (continuous/discrete) ---
     cv_dict = nx.get_edge_attributes(G, 'N_COVISITS')
-    cv_distr, cv_edges_set = get_binned_dist(cv_dict, bins=30)
+    cv_distr, cv_edges_set = get_binned_dist(cv_dict, bins)
 
     # --- nodes: categorical (poi type) ---
     type_dict = {u: data.get('poi_type', 'Unknown')
@@ -112,12 +127,12 @@ def distribution_finder(G):
     # --- nodes: unique visits (continuous) ---
     uv_dict = {u: data.get('unique_visits', 0)
                for u, data in G.nodes(data=True)}
-    uv_distr, uv_nodes_set = get_binned_dist(uv_dict, bins=30)
+    uv_distr, uv_nodes_set = get_binned_dist(uv_dict, bins)
 
     # --- nodes: total visits (continuous) ---
     tv_dict = {u: data.get('total_visits', 0)
                for u, data in G.nodes(data=True)}
-    tv_distr, tv_nodes_set = get_binned_dist(tv_dict, bins=30)
+    tv_distr, tv_nodes_set = get_binned_dist(tv_dict, bins)
 
     # --- topology: degree (discrete) ---
     deg_dict = dict(G.degree())
@@ -134,7 +149,7 @@ def distribution_finder(G):
 # ===================================================================
 
 
-def sample_non_edges(G, distr, total_count):
+def sample_non_edges_dist_controlled(G, distr, total_count):
     # extract coordinates and build a spatial index
     nodes = list(G.nodes())
     coords = np.radians([
@@ -153,25 +168,22 @@ def sample_non_edges(G, distr, total_count):
         raise ValueError("Error: Distribution is empty.")
 
     bin_quotas = {}
-    for left_edge, count in distr.items():
+    for interval, count in distr.items():
         proportion = count / total_edges_in_distr
-        # round to nearest integer for the quota
-        bin_quotas[left_edge] = int(np.round(proportion * total_count))
-
-    # determine the uniform bin width from the pandas Series index
-    index_vals = list(distr.index)
-    bin_width = index_vals[1] - index_vals[0] if len(index_vals) > 1 else 1.0
+        # Round to nearest integer for the quota
+        bin_quotas[interval] = int(np.round(proportion * total_count))
 
     # sample using targeted spatial queries
     with tqdm(total=total_count, desc='Sampling spatial non-edges', unit='edge', leave=False) as pbar:
-        for d_min_km, quota in bin_quotas.items():
+        for interval, quota in bin_quotas.items():
             if quota <= 0:
                 continue
 
-            # reconstruct the max distance using the bin width
-            d_max_km = d_min_km + bin_width
+            # Now we dynamically extract exact bounds from the IntervalIndex
+            d_min_km = interval.left
+            d_max_km = interval.right
 
-            # convert km to radians for the balltree
+            # Convert km to radians for the BallTree
             r_min = d_min_km / EARTH_RADIUS_KM
             r_max = d_max_km / EARTH_RADIUS_KM
 
@@ -225,7 +237,7 @@ def sample_non_edges(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, ftype=None, frac=0.5):
+def prepare_data(fpath, frac=0.5):
     """
     Prepare data for link prediction pipeline.
 
@@ -238,6 +250,7 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
 
     Returns:
+    nx.Graph : original graph
     list : list of negative training samples
     list : list of positive testing samples
     list : list of negative testing samples
@@ -264,8 +277,10 @@ def prepare_data(fpath, ftype=None, frac=0.5):
         dist_bins = distrs[0]  # distance dict
 
         # getting true negatives (overlap possible but very improbable for large datasets)
-        test_non_edges = sample_non_edges(G, dist_bins, len(test_edges))
-        train_non_edges = sample_non_edges(G, dist_bins, len(train_edges))
+        test_non_edges = sample_non_edges_dist_controlled(
+            G, dist_bins, len(test_edges))
+        train_non_edges = sample_non_edges_dist_controlled(
+            G, dist_bins, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
@@ -292,7 +307,7 @@ def prepare_data(fpath, ftype=None, frac=0.5):
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
-    return train_non_edges, test_edges, test_non_edges
+    return G, train_non_edges, test_edges, test_non_edges
 
 # ====================================================================
 
@@ -334,54 +349,88 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         (some may be dropped if embeddings are missing)
     """
     op_fn = BINARY_OPERATORS[operator]
-    rows = []
+
+    # 1. Pre-filter edges missing embeddings to ensure matrix shapes align later
+    valid_edges = []
     kept_indices = []
 
-    for idx, (u, v) in enumerate(edges):
-        vec = []
+    if 'emb' in features:
+        for idx, (u, v) in enumerate(edges):
+            if u in embedding_map and v in embedding_map:
+                valid_edges.append((u, v))
+                kept_indices.append(idx)
+    else:
+        valid_edges = edges
+        kept_indices = list(range(len(edges)))
 
-        # --- embedding features ---
-        if 'emb' in features:
-            emb_u = embedding_map.get(u)
-            emb_v = embedding_map.get(v)
-            if emb_u is None or emb_v is None:
-                continue  # skip this edge entirely
-            vec.append(op_fn(np.array(emb_u), np.array(emb_v)))
+    if not valid_edges:
+        return np.empty((0, 0)), []
 
-        # --- geographic distance ---
-        if 'geo' in features:
-            lat_u = G.nodes[u].get('latitude', 0)
-            lng_u = G.nodes[u].get('longitude', 0)
-            lat_v = G.nodes[v].get('latitude', 0)
-            lng_v = G.nodes[v].get('longitude', 0)
+    # Unzip the list of tuples into two parallel lists of origins (U) and destinations (V)
+    U, V = zip(*valid_edges)
 
-            # haversine in km (same formula your BallTree uses)
-            dlat = np.radians(lat_v - lat_u)
-            dlng = np.radians(lng_v - lng_u)
-            a = (np.sin(dlat / 2) ** 2 +
-                 np.cos(np.radians(lat_u)) * np.cos(np.radians(lat_v)) *
-                 np.sin(dlng / 2) ** 2)
-            dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    feature_blocks = []
 
-            # log(1 + dist) avoids log(0) and compresses scale
-            vec.append(np.array([np.log1p(dist_km)]))
+    # 2. Vectorized Embedding Operations
+    if 'emb' in features:
+        # Extract to 2D arrays: shape (N, 128)
+        emb_u = np.array([embedding_map[u] for u in U])
+        emb_v = np.array([embedding_map[v] for v in V])
 
-        # --- same cat indicator ---
-        if 'cat' in features:
-            cat_u = G.nodes[u].get('poi_type', '')
-            cat_v = G.nodes[v].get('poi_type', '')
-            vec.append(np.array([1.0 if cat_u == cat_v else 0.0]))
+        # Binary operator applies to the entire (N, 128) array simultaneously
+        emb_feat = op_fn(emb_u, emb_v)
+        feature_blocks.append(emb_feat)
 
-        # --- visit counts ---
-        if 'visits' in features:
-            tv_u = G.nodes[u].get('total_visits', 1)
-            tv_v = G.nodes[v].get('total_visits', 1)
-            vec.append(np.array([np.log1p(tv_u), np.log1p(tv_v)]))
+    # 3. Vectorized Geographic Distance (Pure NumPy Haversine)
+    if 'geo' in features:
+        # Fast extraction using list comprehensions (dict lookups are fast, math is slow)
+        lat_u = np.array([G.nodes[u].get('latitude', 0) for u in U])
+        lng_u = np.array([G.nodes[u].get('longitude', 0) for u in U])
+        lat_v = np.array([G.nodes[v].get('latitude', 0) for v in V])
+        lng_v = np.array([G.nodes[v].get('longitude', 0) for v in V])
 
-        rows.append(np.concatenate(vec))
-        kept_indices.append(idx)
+        # Convert all coordinates to radians at once
+        lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
+        lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
 
-    X = np.stack(rows) if rows else np.empty((0, 0))
+        dlat = lat_v_rad - lat_u_rad
+        dlng = lng_v_rad - lng_u_rad
+
+        # Calculate Haversine on the 1D arrays
+        a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
+            np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
+
+        # Clip 'a' to [0, 1] to prevent NaN errors in sqrt due to floating-point precision limits
+        a = np.clip(a, 0.0, 1.0)
+
+        dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+        # Log scale and reshape to (N, 1) column vector
+        geo_feat = np.log1p(dist_km).reshape(-1, 1)
+        feature_blocks.append(geo_feat)
+
+    # 4. Vectorized Categorical Indicator
+    if 'cat' in features:
+        cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
+        cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
+
+        # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
+        cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
+        feature_blocks.append(cat_feat)
+
+    # 5. Vectorized Visit Counts
+    if 'visits' in features:
+        tv_u = np.array([G.nodes[u].get('total_visits', 1) for u in U])
+        tv_v = np.array([G.nodes[v].get('total_visits', 1) for v in V])
+
+        # Log both arrays and stack them as two columns: shape (N, 2)
+        visits_feat = np.column_stack((np.log1p(tv_u), np.log1p(tv_v)))
+        feature_blocks.append(visits_feat)
+
+    # 6. Assemble the Final Matrix
+    # Horizontally stack all requested feature blocks into a single matrix
+    X = np.hstack(feature_blocks)
+
     return X, kept_indices
 
 # ====================================================================
