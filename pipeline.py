@@ -480,13 +480,15 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # unpacking kwargs
     p = kwargs.get('p', 1)
     q = kwargs.get('q', 1)
-    workers = kwargs.get('workers', 4)
+    workers = kwargs.get('workers', 6)
     verbose = kwargs.get('verbose', True)
     dim = kwargs.get('dim', 128)
     num_walks = kwargs.get('num_walks', 10)
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
+    # allow passing in precomputed embeddings
+    embedding_map = kwargs.get('embedding_map', None)
 
     # ===== Validation =====
     needs_metadata = bool({'geo', 'cat', 'visits'} & set(features))
@@ -500,9 +502,11 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     G_train = nx.read_edgelist(trainfile)
 
     # ===== Embedding generation (only if needed) =====
-    embedding_map = None
 
-    if 'emb' in features:
+    if 'emb' in features and embedding_map is not None:
+        print(f"Using precomputed embeddings: {len(embedding_map)} nodes")
+
+    elif 'emb' in features:
         def make_pecanpy_graph(chosen_mode):
             if chosen_mode == 'PreComp':
                 return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose)
