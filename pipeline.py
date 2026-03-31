@@ -237,7 +237,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5):
+def prepare_data(fpath, frac=0.5, meta=False):
     """
     Prepare data for link prediction pipeline.
 
@@ -250,7 +250,7 @@ def prepare_data(fpath, frac=0.5):
     frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
 
     Returns:
-    nx.Graph : original graph
+    nx.Graph : original graph if metadata needed for pipeline
     list : list of negative training samples
     list : list of positive testing samples
     list : list of negative testing samples
@@ -307,7 +307,10 @@ def prepare_data(fpath, frac=0.5):
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
-    return G, train_non_edges, test_edges, test_non_edges
+    if meta:
+        return G, train_non_edges, test_edges, test_non_edges
+    else:
+        return train_non_edges, test_edges, test_non_edges
 
 # ====================================================================
 
