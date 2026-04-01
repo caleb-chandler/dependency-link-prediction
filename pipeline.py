@@ -410,13 +410,38 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         feature_blocks.append(geo_feat)
 
     # 4. Vectorized Categorical Indicator
-    if 'cat' in features:
+    if 'cat_same' in features:
         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
 
         # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
         feature_blocks.append(cat_feat)
+
+    # Vectorized One-Hot Category Encoding
+    if 'cat' in features:
+        # Build vocabulary from ALL nodes in G so train/test columns always align
+        all_cats = sorted({
+            G.nodes[n].get('poi_type', 'Unknown')
+            for n in G.nodes()
+        })
+        cat_to_idx = {c: i for i, c in enumerate(all_cats)}
+        n_cats = len(all_cats)
+
+        cat_u = [G.nodes[u].get('poi_type', 'Unknown') for u in U]
+        cat_v = [G.nodes[v].get('poi_type', 'Unknown') for v in V]
+
+        # Build two one-hot matrices: (N, n_cats) each
+        oh_u = np.zeros((len(U), n_cats))
+        oh_v = np.zeros((len(V), n_cats))
+
+        for i, (cu, cv) in enumerate(zip(cat_u, cat_v)):
+            oh_u[i, cat_to_idx.get(cu, 0)] = 1.0
+            oh_v[i, cat_to_idx.get(cv, 0)] = 1.0
+
+        # Stack side by side: (N, 2 * n_cats)
+        cat_oh_feat = np.hstack([oh_u, oh_v])
+        feature_blocks.append(cat_oh_feat)
 
     # 5. Vectorized Visit Counts
     if 'visits' in features:
