@@ -1,3 +1,4 @@
+import queue
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -12,11 +13,17 @@ from sklearn.pipeline import make_pipeline
 from sklearn.neighbors import BallTree
 
 
-def load(fpath):
+def load(fpath, compress=False):
     df = pd.read_csv(fpath, sep='\s+', names=['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
                                               'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
                                               'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
                                               'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP'])
+
+    # optional log-compression of DEP
+    if compress:
+        scale_factor = 1.0 / np.median(df['DEP'])
+        df['DEP'] = df['DEP'].apply(lambda x: np.log1p(x * scale_factor))
+
     G = nx.from_pandas_edgelist(
         df,
         source='ORIGIN',
@@ -237,7 +244,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5):
+def prepare_data(fpath, frac=0.5, seed=None, compress=0):
     """
     Prepare data for link prediction pipeline.
 
@@ -248,6 +255,7 @@ def prepare_data(fpath, frac=0.5):
     Parameters:
     fpath (str): Path to the graph file. Must be readable as an edgelist.
     frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
+    seed (int, optional): Seed for reproducibility.
 
     Returns:
     nx.Graph : original graph
@@ -256,10 +264,15 @@ def prepare_data(fpath, frac=0.5):
     list : list of negative testing samples
     """
 
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
     def split(G, frac=frac):
         # load edges as sorted tuples for efficiency
         edges = {tuple(sorted(e)) for e in G.edges()}
-        mst = {tuple(sorted(e)) for e in nx.minimum_spanning_tree(G).edges()}
+        mst = {tuple(sorted(e))
+               for e in nx.maximum_spanning_tree(G, weight='DEP')}
 
         # fast set difference
         removable_edges = list(edges - mst)
@@ -270,7 +283,9 @@ def prepare_data(fpath, frac=0.5):
         # build training graph
         G_train = nx.Graph()
         G_train.add_nodes_from(G.nodes())
-        G_train.add_edges_from(train_edges)
+        G_train.add_weighted_edges_from(
+            [(u, v, G[u][v]['DEP']) for u, v in train_edges]
+        )
 
         # sample non-edges by bin to preserve distribution
         distrs, sets = distribution_finder(G)
@@ -284,7 +299,7 @@ def prepare_data(fpath, frac=0.5):
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
-    G = load(fpath)
+    G = load(fpath, compress)
 
     # failsafe
     if G.number_of_nodes() == 0:
@@ -303,7 +318,9 @@ def prepare_data(fpath, frac=0.5):
         return None
 
     # saving training graph
-    nx.write_edgelist(G_train, 'train.txt', data=False)
+    with open('train.txt', 'w') as f:
+        for u, v, d in G_train.edges(data=True):
+            f.write(f"{u} {v} {d.get('weight', 1.0)}\n")
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
@@ -461,7 +478,8 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 # ====================================================================
 
 
-def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'], mode='PreComp', operator='hadamard', **kwargs):
+def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
+                 mode='PreComp', operator='hadamard', **kwargs):
     """
     Run the link prediction pipeline with flexible feature composition.
 
@@ -493,7 +511,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     operator : str
         Binary operator for embeddings. Default 'hadamard'.
     **kwargs
-        Hyperparameter settings forwarded to PecanPy / Word2Vec.
+        Hyperparameter settings forwarded to PecanPy / Word2Vec. Also allows for seed.
 
     Returns
     -------
@@ -502,7 +520,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     embedding_map : dict or None
         Node embeddings (only populated when 'emb' in features).
     """
-    # unpacking kwargs
+    # === unpacking kwargs ===
+    # hyperparameters
     p = kwargs.get('p', 1)
     q = kwargs.get('q', 1)
     workers = kwargs.get('workers', 6)
@@ -514,6 +533,15 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     epochs = kwargs.get('epochs', 1)
     # allow passing in precomputed embeddings
     embedding_map = kwargs.get('embedding_map', None)
+    # switch for weighted/directed version
+    weighted = kwargs.get('weighted', False)
+    directed = kwargs.get('directed', False)
+
+    # seed
+    seed = kwargs.get('seed', None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
     # ===== Validation =====
     needs_metadata = bool({'geo', 'cat', 'visits'} & set(features))
@@ -552,15 +580,16 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         for candidate_mode in tried_modes:
             try:
                 g = make_pecanpy_graph(candidate_mode)
-                g.read_edg('train.txt', weighted=False,
-                           directed=False, delimiter=' ')
+                g.read_edg(trainfile, weighted=weighted,
+                           directed=directed, delimiter=' ')
                 if candidate_mode == 'PreComp':
                     g.preprocess_transition_probs()
 
                 embeddings = g.embed(
                     dim=dim, num_walks=num_walks,
                     walk_length=walk_length, window_size=window_size,
-                    epochs=epochs, verbose=verbose
+                    epochs=epochs, verbose=verbose,
+                    seed=seed if seed is not None else 0
                 )
 
                 if candidate_mode != mode:

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; nb=json.load\\(open\\('analysis.ipynb'\\)\\); [print\\(i, c['id'], repr\\(c['source'][:80] if c['source'] else ''\\)\\) for i,c in enumerate\\(nb['cells']\\)]\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('analysis.ipynb'\\)\\); print\\('Total cells:', len\\(nb['cells']\\)\\); [print\\(i, c['id'], repr\\(c['source'][:60] if isinstance\\(c['source'], str\\) else ''\\)\\) for i,c in enumerate\\(nb['cells'][-4:]\\)]\")"
+    ]
+  }
+}
