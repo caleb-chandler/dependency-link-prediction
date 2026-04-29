@@ -19,10 +19,13 @@ def load(fpath, compress=False):
                                               'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
                                               'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP'])
 
-    # optional log-compression of DEP
+    # optional log-compression
     if compress:
         scale_factor = 1.0 / np.median(df['DEP'])
         df['DEP'] = df['DEP'].apply(lambda x: np.log1p(x * scale_factor))
+        scale_factor = 1.0 / np.median(df['N_COVISITS'])
+        df['N_COVISITS'] = df['N_COVISITS'].apply(
+            lambda x: np.log1p(x * scale_factor))
 
     G = nx.from_pandas_edgelist(
         df,
@@ -56,9 +59,6 @@ def load(fpath, compress=False):
     nx.set_node_attributes(G, tax_dict, 'poi_type')
     nx.set_node_attributes(G, uv_dict, 'unique_visits')
     nx.set_node_attributes(G, tv_dict, 'total_visits')
-
-    # verification
-    print(f"Attribute check: {random.choice(list(G.nodes(data=True)))}")
 
     print(f"Nodes: {G.number_of_nodes()}")
     print(f"Edges: {G.number_of_edges()}")
@@ -244,7 +244,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, seed=None, compress=0):
+def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
     """
     Prepare data for link prediction pipeline.
 
@@ -283,9 +283,15 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0):
         # build training graph
         G_train = nx.Graph()
         G_train.add_nodes_from(G.nodes())
-        G_train.add_weighted_edges_from(
-            [(u, v, G[u][v]['DEP']) for u, v in train_edges]
-        )
+        # handle weights or not
+        if weight == 'dep':
+            G_train.add_weighted_edges_from(
+                [(u, v, G[u][v]['DEP']) for u, v in train_edges])
+        elif weight == 'cov':
+            G_train.add_weighted_edges_from(
+                [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
+        else:
+            G_train.add_edges_from(train_edges)
 
         # sample non-edges by bin to preserve distribution
         distrs, sets = distribution_finder(G)
