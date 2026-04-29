@@ -558,7 +558,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         )
 
     # converting training graph to nx.Graph object
-    G_train = nx.read_edgelist(trainfile)
+    G_train = nx.read_edgelist(trainfile, data=[('weight', float)])
 
     # ===== Embedding generation (only if needed) =====
 
@@ -595,7 +595,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                     dim=dim, num_walks=num_walks,
                     walk_length=walk_length, window_size=window_size,
                     epochs=epochs, verbose=verbose,
-                    seed=seed if seed is not None else 0
                 )
 
                 if candidate_mode != mode:
