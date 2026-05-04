@@ -566,13 +566,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"Using precomputed embeddings: {len(embedding_map)} nodes")
 
     elif 'emb' in features:
-        def make_pecanpy_graph(chosen_mode):
+        def make_pecanpy_graph(chosen_mode, w_bool):
             if chosen_mode == 'PreComp':
-                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             elif chosen_mode == 'SparseOTF':
-                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             elif chosen_mode == 'DenseOTF':
-                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             else:
                 raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
 
@@ -585,7 +585,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         last_exception = None
         for candidate_mode in tried_modes:
             try:
-                g = make_pecanpy_graph(candidate_mode)
+                g = make_pecanpy_graph(candidate_mode, weighted)
                 g.read_edg(trainfile, weighted=weighted,
                            directed=directed, delimiter=' ')
                 if candidate_mode == 'PreComp':
