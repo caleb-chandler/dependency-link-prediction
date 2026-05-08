@@ -432,7 +432,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    # 4. Vectorized Categorical Indicator
+    # 4. same
     if 'cat_same' in features:
         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
@@ -441,7 +441,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
         feature_blocks.append(cat_feat)
 
-    # Vectorized One-Hot Category Encoding
+    # one-hot (new matrix for each combo i believe)
     if 'cat' in features:
         # Build vocabulary from ALL nodes in G so train/test columns always align
         all_cats = sorted({
