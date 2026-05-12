@@ -307,7 +307,7 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
-    G = load(fpath, compress)
+    G = load(fpath, compress=compress)
 
     # failsafe
     if G.number_of_nodes() == 0:
@@ -662,7 +662,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
     if 'cbg' in features:
-        assign_cbg_to_nodes(G, 'data/cbg/tl_2025_bg.shp')
+        assign_cbg_to_nodes(G, 'data/cbg/tl_2025_25_bg.shp')
 
     if 'comm' in features:
         assign_node_to_comm(G)
