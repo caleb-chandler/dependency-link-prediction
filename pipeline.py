@@ -390,10 +390,10 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
-        'cat'       – 
+        'cat'       – (N, 2 x N_cats) matrix containing a combination of two one-hot matrices for endpoint categories
         'cbg'       - binary for same census-block group
         'comm'      - binary for same infomap community
-        'ls'        - 
+        'ls'        - concatenated embeddings from endpoint categories constructed from word2vec on activity sequences
 
 
 
@@ -472,7 +472,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    # one-hot (new matrix for each combo i believe)
+    # one-hot (new matrix for each combo)
     if 'cat' in features:
         # Build vocabulary from ALL nodes in G so train/test columns always align
         all_cats = sorted({
@@ -524,14 +524,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
                  mode='PreComp', operator='hadamard', **kwargs):
     """
-    Run the link prediction pipeline with flexible feature composition.
-
-    Features are controlled by the `features` list, which can contain
-    any combination of:
-        'emb'       – node2vec embedding (binary operator applied per edge)
-        'geo'       – log geographic distance between nodes
-        'cat'       – same/different POI category indicator
-        'visits'    – log total visits for both nodes
+    Run the link prediction pipeline with flexible feature composition. Features are controlled by the `features` list.
 
     Parameters
     ----------
@@ -547,8 +540,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         The *original* graph with node attributes (latitude, longitude,
         poi_type, total_visits). Required when features includes anything
         other than 'emb'.
-    features : list of str
-        Which features to include. Default ['emb'].
+    features : list of str or 'all'
+        Which features to include. Default ['emb']. If 'all' then includes all features.
     mode : str
         PecanPy walk mode. Default 'PreComp'.
     operator : str
@@ -586,8 +579,11 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         random.seed(seed)
         np.random.seed(seed)
 
+    if features == 'all':
+        features = ['emb', 'geo', 'cat', 'cbg', 'comm']
+
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat', 'visits'} & set(features))
+    needs_metadata = bool({'geo', 'cat'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
             "Graph G with node attributes is required when features "
@@ -663,13 +659,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
 
     # ===== Assemble feature matrices =====
-    train_pos_edges = list(G_train.edges())
+    train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
     if 'cbg' in features:
         assign_cbg_to_nodes(G, 'data/cbg/tl_2025_bg.shp')
 
     if 'comm' in features:
-        assign_node_to_comm
+        assign_node_to_comm(G)
 
     X_train_pos, kept_pos = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator)
