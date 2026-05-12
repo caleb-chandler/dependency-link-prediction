@@ -1,4 +1,3 @@
-import queue
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -11,6 +10,9 @@ from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.neighbors import BallTree
+import geopandas as gpd
+from shapely.geometry import Point
+from infomap import Infomap
 
 
 def load(fpath, compress=False):
@@ -345,6 +347,40 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
+def assign_cbg_to_nodes(G, shapefile_path):
+    """Add 'cbg' attribute to each node in G via spatial join."""
+    nodes = list(G.nodes())
+    lats = [G.nodes[n].get('latitude', 0) for n in nodes]
+    lngs = [G.nodes[n].get('longitude', 0) for n in nodes]
+
+    poi_gdf = gpd.GeoDataFrame(
+        {'node_id': nodes},
+        geometry=[Point(lng, lat) for lng, lat in zip(lngs, lats)],
+        crs='EPSG:4326'
+    )
+
+    cbg_gdf = gpd.read_file(shapefile_path).to_crs('EPSG:4326')
+    joined = gpd.sjoin(poi_gdf, cbg_gdf, how='left', predicate='within')
+
+    for _, row in joined.iterrows():
+        G.nodes[row['node_id']]['cbg'] = row.get('GEOID', 'Unknown')
+
+
+def assign_node_to_comm(G):
+    im = Infomap("--num-trials 20")
+    mapping = im.add_networkx_graph(G, weight='N_COVISITS')
+    print("Running Infomap...")
+    im.run()
+    print("Done.")
+
+    for node_id, module_id in im.modules.items():
+        nx_id = mapping[node_id]  # map back from Infomap's internal IDs
+        G.nodes[nx_id]['community'] = module_id
+
+    print(
+        f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
+
+
 def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard'):
     """
     Build a feature matrix for a list of node pairs.
@@ -354,8 +390,12 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
-        'cat'       – 1 if same top-level POI category, else 0  (1-d)
-        'visits'    – log total visits for u and v  (2-d)
+        'cat'       – 
+        'cbg'       - binary for same census-block group
+        'comm'      - binary for same infomap community
+        'ls'        - 
+
+
 
     Parameters
     ----------
@@ -432,15 +472,6 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    # 4. same
-    if 'cat_same' in features:
-        cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
-        cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
-
-        # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
-        cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
-        feature_blocks.append(cat_feat)
-
     # one-hot (new matrix for each combo i believe)
     if 'cat' in features:
         # Build vocabulary from ALL nodes in G so train/test columns always align
@@ -466,16 +497,22 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         cat_oh_feat = np.hstack([oh_u, oh_v])
         feature_blocks.append(cat_oh_feat)
 
-    # 5. Vectorized Visit Counts
-    if 'visits' in features:
-        tv_u = np.array([G.nodes[u].get('total_visits', 1) for u in U])
-        tv_v = np.array([G.nodes[v].get('total_visits', 1) for v in V])
+    if 'cbg' in features:
+        cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
+        cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
+        cbg_feat = (cbg_u == cbg_v).astype(float).reshape(-1, 1)
+        feature_blocks.append(cbg_feat)
 
-        # Log both arrays and stack them as two columns: shape (N, 2)
-        visits_feat = np.column_stack((np.log1p(tv_u), np.log1p(tv_v)))
-        feature_blocks.append(visits_feat)
+    if 'comm' in features:
+        comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
+        comm_v = np.array([G.nodes[v].get('community', -1) for v in V])
+        comm_feat = (comm_u == comm_v).astype(float).reshape(-1, 1)
+        feature_blocks.append(comm_feat)
 
-    # 6. Assemble the Final Matrix
+    if 'ls' in features:
+        pass
+
+    # Assemble the Final Matrix
     # Horizontally stack all requested feature blocks into a single matrix
     X = np.hstack(feature_blocks)
 
@@ -581,6 +618,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             tried_modes.append('PreComp')
         if mode not in ['SparseOTF', 'DenseOTF']:
             tried_modes.append('DenseOTF')
+        # PreComp alias_indptr overflows uint32 for large weighted graphs;
+        # SparseOTF computes transition probs on-the-fly and avoids this.
+        if weighted and 'SparseOTF' not in tried_modes:
+            tried_modes.insert(0, 'SparseOTF')
 
         last_exception = None
         for candidate_mode in tried_modes:
@@ -623,6 +664,12 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Assemble feature matrices =====
     train_pos_edges = list(G_train.edges())
+
+    if 'cbg' in features:
+        assign_cbg_to_nodes(G, 'data/cbg/tl_2025_bg.shp')
+
+    if 'comm' in features:
+        assign_node_to_comm
 
     X_train_pos, kept_pos = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator)
