@@ -380,7 +380,7 @@ def assign_node_to_comm(G):
         f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
 
 
-def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard'):
+def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard', cat_threshold=1):
     """
     Build a feature matrix for a list of node pairs.
 
@@ -470,30 +470,32 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    # one-hot (new matrix for each combo)
     if 'cat' in features:
-        # Build vocabulary from ALL nodes in G so train/test columns always align
-        all_cats = sorted({
-            G.nodes[n].get('poi_type', 'Unknown')
-            for n in G.nodes()
-        })
-        cat_to_idx = {c: i for i, c in enumerate(all_cats)}
-        n_cats = len(all_cats)
+        # Count each undirected type-pair across all edges in G
+        pair_counts = {}
+        for eu, ev in G.edges():
+            cu = G.nodes[eu].get('poi_type', 'Unknown')
+            cv = G.nodes[ev].get('poi_type', 'Unknown')
+            pair = tuple(sorted([cu, cv]))
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
-        cat_u = [G.nodes[u].get('poi_type', 'Unknown') for u in U]
-        cat_v = [G.nodes[v].get('poi_type', 'Unknown') for v in V]
+        # Vocabulary: only pairs observed >= cat_threshold times, sorted for stable columns
+        vocab = sorted(p for p, cnt in pair_counts.items()
+                       if cnt >= cat_threshold)
+        print(
+            f'# kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({(len(vocab)/210)*100}%)')
+        pair_to_idx = {p: i for i, p in enumerate(vocab)}
 
-        # Build two one-hot matrices: (N, n_cats) each
-        oh_u = np.zeros((len(U), n_cats))
-        oh_v = np.zeros((len(V), n_cats))
+        cat_feat = np.zeros((len(U), len(vocab)))
+        for i, (u, v) in enumerate(zip(U, V)):
+            cu = G.nodes[u].get('poi_type', 'Unknown')
+            cv = G.nodes[v].get('poi_type', 'Unknown')
+            pair = tuple(sorted([cu, cv]))
+            idx = pair_to_idx.get(pair)
+            if idx is not None:
+                cat_feat[i, idx] = 1.0
 
-        for i, (cu, cv) in enumerate(zip(cat_u, cat_v)):
-            oh_u[i, cat_to_idx.get(cu, 0)] = 1.0
-            oh_v[i, cat_to_idx.get(cv, 0)] = 1.0
-
-        # Stack side by side: (N, 2 * n_cats)
-        cat_oh_feat = np.hstack([oh_u, oh_v])
-        feature_blocks.append(cat_oh_feat)
+        feature_blocks.append(cat_feat)
 
     if 'cat_same' in features:
         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
@@ -575,6 +577,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
+    cat_threshold = kwargs.get('cat_threshold', 1)
     # allow passing in precomputed embeddings
     embedding_map = kwargs.get('embedding_map', None)
     # switch for weighted/directed version
@@ -676,9 +679,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         assign_node_to_comm(G)
 
     X_train_pos, _ = build_feature_matrix(
-        train_pos_edges, G, features, embedding_map, operator)
+        train_pos_edges, G, features, embedding_map, operator, cat_threshold)
     X_train_neg, _ = build_feature_matrix(
-        train_non_edges, G, features, embedding_map, operator)
+        train_non_edges, G, features, embedding_map, operator, cat_threshold)
 
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
@@ -700,9 +703,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Test =====
     X_test_pos, _ = build_feature_matrix(
-        test_edges, G, features, embedding_map, operator)
+        test_edges, G, features, embedding_map, operator, cat_threshold)
     X_test_neg, _ = build_feature_matrix(
-        test_non_edges, G, features, embedding_map, operator)
+        test_non_edges, G, features, embedding_map, operator, cat_threshold)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     y_test = np.concatenate([
