@@ -368,14 +368,13 @@ def assign_cbg_to_nodes(G, shapefile_path):
 
 def assign_node_to_comm(G):
     im = Infomap("--num-trials 20")
-    mapping = im.add_networkx_graph(G, weight='N_COVISITS')
+    im_to_nx = im.add_networkx_graph(G, weight='N_COVISITS')
     print("Running Infomap...")
     im.run()
     print("Done.")
 
-    for node_id, module_id in im.modules.items():
-        nx_id = mapping[node_id]  # map back from Infomap's internal IDs
-        G.nodes[nx_id]['community'] = module_id
+    for node_id, module_id in im.modules:
+        G.nodes[im_to_nx[node_id]]['community'] = module_id
 
     print(
         f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
@@ -390,12 +389,11 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
-        'cat'       – (N, 2 x N_cats) matrix containing a combination of two one-hot matrices for endpoint categories
-        'cbg'       - binary for same census-block group
-        'comm'      - binary for same infomap community
+        'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
+        'cat_same'  - simplified same/different category feature for baseline comparison
+        'cbg'       - binary for same/different census-block group
+        'comm'      - binary for same/different infomap community
         'ls'        - concatenated embeddings from endpoint categories constructed from word2vec on activity sequences
-
-
 
     Parameters
     ----------
@@ -497,16 +495,26 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         cat_oh_feat = np.hstack([oh_u, oh_v])
         feature_blocks.append(cat_oh_feat)
 
+    if 'cat_same' in features:
+        cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
+        cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
+
+        # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
+        cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
+        feature_blocks.append(cat_feat)
+
     if 'cbg' in features:
         cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
         cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
-        cbg_feat = (cbg_u == cbg_v).astype(float).reshape(-1, 1)
+        cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
+                    ).astype(float).reshape(-1, 1)
         feature_blocks.append(cbg_feat)
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
         comm_v = np.array([G.nodes[v].get('community', -1) for v in V])
-        comm_feat = (comm_u == comm_v).astype(float).reshape(-1, 1)
+        comm_feat = ((comm_u == comm_v) & (comm_u != -1)
+                     ).astype(float).reshape(-1, 1)
         feature_blocks.append(comm_feat)
 
     if 'ls' in features:
@@ -583,7 +591,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         features = ['emb', 'geo', 'cat', 'cbg', 'comm']
 
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat'} & set(features))
+    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
             "Graph G with node attributes is required when features "
@@ -667,9 +675,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     if 'comm' in features:
         assign_node_to_comm(G)
 
-    X_train_pos, kept_pos = build_feature_matrix(
+    X_train_pos, _ = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator)
-    X_train_neg, kept_neg = build_feature_matrix(
+    X_train_neg, _ = build_feature_matrix(
         train_non_edges, G, features, embedding_map, operator)
 
     X_train = np.vstack([X_train_pos, X_train_neg])
