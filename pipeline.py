@@ -10,17 +10,24 @@ from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.neighbors import BallTree
+import geopandas as gpd
+from shapely.geometry import Point
+from infomap import Infomap
 
 
-def load(fpath):
-    df = pd.read_csv(fpath, sep='\s+', names=['ORIGIN', 'DESTINATION', 'TAXONOMY_ORIGIN',
+def load(fpath, compress=False):
+    df = pd.read_csv(fpath, sep='\s+', names=['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
                                               'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
                                               'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
                                               'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP'])
 
-    # cast to str for consistency/cleanliness
-    df['ORIGIN'] = df['ORIGIN'].astype(str)
-    df['DESTINATION'] = df['DESTINATION'].astype(str)
+    # optional log-compression
+    if compress:
+        scale_factor = 1.0 / np.median(df['DEP'])
+        df['DEP'] = df['DEP'].apply(lambda x: np.log1p(x * scale_factor))
+        scale_factor = 1.0 / np.median(df['N_COVISITS'])
+        df['N_COVISITS'] = df['N_COVISITS'].apply(
+            lambda x: np.log1p(x * scale_factor))
 
     G = nx.from_pandas_edgelist(
         df,
@@ -55,9 +62,6 @@ def load(fpath):
         G, node_data['unique_visits'].to_dict(), 'unique_visits')
     nx.set_node_attributes(
         G, node_data['total_visits'].to_dict(), 'total_visits')
-
-    # verification
-    print(f"Attribute check: {random.choice(list(G.nodes(data=True)))}")
 
     print(f"Nodes: {G.number_of_nodes()}")
     print(f"Edges: {G.number_of_edges()}")
@@ -239,7 +243,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, meta=False):
+def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
     """
     Prepare data for link prediction pipeline.
 
@@ -250,6 +254,7 @@ def prepare_data(fpath, frac=0.5, meta=False):
     Parameters:
     fpath (str): Path to the graph file. Must be readable as an edgelist.
     frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
+    seed (int, optional): Seed for reproducibility.
 
     Returns:
     nx.Graph : original graph if metadata needed for pipeline
@@ -258,10 +263,15 @@ def prepare_data(fpath, frac=0.5, meta=False):
     list : list of negative testing samples
     """
 
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
     def split(G, frac=frac):
         # load edges as sorted tuples for efficiency
         edges = {tuple(sorted(e)) for e in G.edges()}
-        mst = {tuple(sorted(e)) for e in nx.minimum_spanning_tree(G).edges()}
+        mst = {tuple(sorted(e))
+               for e in nx.maximum_spanning_tree(G, weight='DEP')}
 
         # fast set difference
         removable_edges = list(edges - mst)
@@ -272,7 +282,15 @@ def prepare_data(fpath, frac=0.5, meta=False):
         # build training graph
         G_train = nx.Graph()
         G_train.add_nodes_from(G.nodes())
-        G_train.add_edges_from(train_edges)
+        # handle weights or not
+        if weight == 'dep':
+            G_train.add_weighted_edges_from(
+                [(u, v, G[u][v]['DEP']) for u, v in train_edges])
+        elif weight == 'cov':
+            G_train.add_weighted_edges_from(
+                [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
+        else:
+            G_train.add_edges_from(train_edges)
 
         # sample non-edges by bin to preserve distribution
         distrs, sets = distribution_finder(G)
@@ -286,7 +304,7 @@ def prepare_data(fpath, frac=0.5, meta=False):
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
-    G = load(fpath)
+    G = load(fpath, compress=compress)
 
     # failsafe
     if G.number_of_nodes() == 0:
@@ -305,7 +323,9 @@ def prepare_data(fpath, frac=0.5, meta=False):
         return None
 
     # saving training graph
-    nx.write_edgelist(G_train, 'train.txt', data=False)
+    with open('train.txt', 'w') as f:
+        for u, v, d in G_train.edges(data=True):
+            f.write(f"{u} {v} {d.get('weight', 1.0)}\n")
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
@@ -327,7 +347,40 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard'):
+def assign_cbg_to_nodes(G, shapefile_path):
+    """Add 'cbg' attribute to each node in G via spatial join."""
+    nodes = list(G.nodes())
+    lats = [G.nodes[n].get('latitude', 0) for n in nodes]
+    lngs = [G.nodes[n].get('longitude', 0) for n in nodes]
+
+    poi_gdf = gpd.GeoDataFrame(
+        {'node_id': nodes},
+        geometry=[Point(lng, lat) for lng, lat in zip(lngs, lats)],
+        crs='EPSG:4326'
+    )
+
+    cbg_gdf = gpd.read_file(shapefile_path).to_crs('EPSG:4326')
+    joined = gpd.sjoin(poi_gdf, cbg_gdf, how='left', predicate='within')
+
+    for _, row in joined.iterrows():
+        G.nodes[row['node_id']]['cbg'] = row.get('GEOID', 'Unknown')
+
+
+def assign_node_to_comm(G):
+    im = Infomap("--num-trials 20")
+    im_to_nx = im.add_networkx_graph(G, weight='N_COVISITS')
+    print("Running Infomap...")
+    im.run()
+    print("Done.")
+
+    for node_id, module_id in im.modules:
+        G.nodes[im_to_nx[node_id]]['community'] = module_id
+
+    print(
+        f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
+
+
+def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard', cat_threshold=1):
     """
     Build a feature matrix for a list of node pairs.
 
@@ -336,8 +389,11 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
-        'cat'       – 1 if same top-level POI category, else 0  (1-d)
-        'visits'    – log total visits for u and v  (2-d)
+        'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
+        'catsame'  - simplified same/different category feature for baseline comparison
+        'cbg'       - binary for same/different census-block group
+        'comm'      - binary for same/different infomap community
+        'ls'        - concatenated embeddings from endpoint categories constructed from word2vec on activity sequences
 
     Parameters
     ----------
@@ -414,8 +470,34 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    # 4. Vectorized Categorical Indicator
     if 'cat' in features:
+        # Count each undirected type-pair across all edges in G
+        pair_counts = {}
+        for eu, ev in G.edges():
+            cu = G.nodes[eu].get('poi_type', 'Unknown')
+            cv = G.nodes[ev].get('poi_type', 'Unknown')
+            pair = tuple(sorted([cu, cv]))
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+
+        # Vocabulary: only pairs observed >= cat_threshold times, sorted for stable columns
+        vocab = sorted(p for p, cnt in pair_counts.items()
+                       if cnt >= cat_threshold)
+        print(
+            f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
+        pair_to_idx = {p: i for i, p in enumerate(vocab)}
+
+        cat_feat = np.zeros((len(U), len(vocab)))
+        for i, (u, v) in enumerate(zip(U, V)):
+            cu = G.nodes[u].get('poi_type', 'Unknown')
+            cv = G.nodes[v].get('poi_type', 'Unknown')
+            pair = tuple(sorted([cu, cv]))
+            idx = pair_to_idx.get(pair)
+            if idx is not None:
+                cat_feat[i, idx] = 1.0
+
+        feature_blocks.append(cat_feat)
+
+    if 'catsame' in features:
         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
 
@@ -423,16 +505,24 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
         feature_blocks.append(cat_feat)
 
-    # 5. Vectorized Visit Counts
-    if 'visits' in features:
-        tv_u = np.array([G.nodes[u].get('total_visits', 1) for u in U])
-        tv_v = np.array([G.nodes[v].get('total_visits', 1) for v in V])
+    if 'cbg' in features:
+        cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
+        cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
+        cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
+                    ).astype(float).reshape(-1, 1)
+        feature_blocks.append(cbg_feat)
 
-        # Log both arrays and stack them as two columns: shape (N, 2)
-        visits_feat = np.column_stack((np.log1p(tv_u), np.log1p(tv_v)))
-        feature_blocks.append(visits_feat)
+    if 'comm' in features:
+        comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
+        comm_v = np.array([G.nodes[v].get('community', -1) for v in V])
+        comm_feat = ((comm_u == comm_v) & (comm_u != -1)
+                     ).astype(float).reshape(-1, 1)
+        feature_blocks.append(comm_feat)
 
-    # 6. Assemble the Final Matrix
+    if 'ls' in features:
+        pass
+
+    # Assemble the Final Matrix
     # Horizontally stack all requested feature blocks into a single matrix
     X = np.hstack(feature_blocks)
 
@@ -441,16 +531,10 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard')
 # ====================================================================
 
 
-def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'], mode='PreComp', operator='hadamard', **kwargs):
+def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
+                 mode='PreComp', operator='hadamard', **kwargs):
     """
-    Run the link prediction pipeline with flexible feature composition.
-
-    Features are controlled by the `features` list, which can contain
-    any combination of:
-        'emb'       – node2vec embedding (binary operator applied per edge)
-        'geo'       – log geographic distance between nodes
-        'cat'       – same/different POI category indicator
-        'visits'    – log total visits for both nodes
+    Run the link prediction pipeline with flexible feature composition. Features are controlled by the `features` list.
 
     Parameters
     ----------
@@ -466,14 +550,14 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         The *original* graph with node attributes (latitude, longitude,
         poi_type, total_visits). Required when features includes anything
         other than 'emb'.
-    features : list of str
-        Which features to include. Default ['emb'].
+    features : list of str or 'all'
+        Which features to include. Default ['emb']. If 'all' then includes all features.
     mode : str
         PecanPy walk mode. Default 'PreComp'.
     operator : str
         Binary operator for embeddings. Default 'hadamard'.
     **kwargs
-        Hyperparameter settings forwarded to PecanPy / Word2Vec.
+        Hyperparameter settings forwarded to PecanPy / Word2Vec. Also allows for seed.
 
     Returns
     -------
@@ -482,7 +566,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     embedding_map : dict or None
         Node embeddings (only populated when 'emb' in features).
     """
-    # unpacking kwargs
+    # === unpacking kwargs ===
+    # hyperparameters
     p = kwargs.get('p', 1)
     q = kwargs.get('q', 1)
     workers = kwargs.get('workers', 6)
@@ -492,11 +577,24 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
+    cat_threshold = kwargs.get('cat_threshold', 1)
     # allow passing in precomputed embeddings
     embedding_map = kwargs.get('embedding_map', None)
+    # switch for weighted/directed version
+    weighted = kwargs.get('weighted', False)
+    directed = kwargs.get('directed', False)
+
+    # seed
+    seed = kwargs.get('seed', None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    if features == 'all':
+        features = ['emb', 'geo', 'cat', 'cbg', 'comm']
 
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat', 'visits'} & set(features))
+    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
             "Graph G with node attributes is required when features "
@@ -504,7 +602,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         )
 
     # converting training graph to nx.Graph object
-    G_train = nx.read_edgelist(trainfile)
+    G_train = nx.read_edgelist(trainfile, data=[('weight', float)])
 
     # ===== Embedding generation (only if needed) =====
 
@@ -512,13 +610,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"Using precomputed embeddings: {len(embedding_map)} nodes")
 
     elif 'emb' in features:
-        def make_pecanpy_graph(chosen_mode):
+        def make_pecanpy_graph(chosen_mode, w_bool):
             if chosen_mode == 'PreComp':
-                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             elif chosen_mode == 'SparseOTF':
-                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             elif chosen_mode == 'DenseOTF':
-                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose)
+                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
             else:
                 raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
 
@@ -527,20 +625,24 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             tried_modes.append('PreComp')
         if mode not in ['SparseOTF', 'DenseOTF']:
             tried_modes.append('DenseOTF')
+        # PreComp alias_indptr overflows uint32 for large weighted graphs;
+        # SparseOTF computes transition probs on-the-fly and avoids this.
+        if weighted and 'SparseOTF' not in tried_modes:
+            tried_modes.insert(0, 'SparseOTF')
 
         last_exception = None
         for candidate_mode in tried_modes:
             try:
-                g = make_pecanpy_graph(candidate_mode)
-                g.read_edg('train.txt', weighted=False,
-                           directed=False, delimiter=' ')
+                g = make_pecanpy_graph(candidate_mode, weighted)
+                g.read_edg(trainfile, weighted=weighted,
+                           directed=directed, delimiter=' ')
                 if candidate_mode == 'PreComp':
                     g.preprocess_transition_probs()
 
                 embeddings = g.embed(
                     dim=dim, num_walks=num_walks,
                     walk_length=walk_length, window_size=window_size,
-                    epochs=epochs, verbose=verbose
+                    epochs=epochs, verbose=verbose,
                 )
 
                 if candidate_mode != mode:
@@ -566,12 +668,18 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
 
     # ===== Assemble feature matrices =====
-    train_pos_edges = list(G_train.edges())
+    train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
-    X_train_pos, kept_pos = build_feature_matrix(
-        train_pos_edges, G, features, embedding_map, operator)
-    X_train_neg, kept_neg = build_feature_matrix(
-        train_non_edges, G, features, embedding_map, operator)
+    if 'cbg' in features:
+        assign_cbg_to_nodes(G, 'data/cbg/tl_2025_25_bg.shp')
+
+    if 'comm' in features:
+        assign_node_to_comm(G)
+
+    X_train_pos, _ = build_feature_matrix(
+        train_pos_edges, G, features, embedding_map, operator, cat_threshold)
+    X_train_neg, _ = build_feature_matrix(
+        train_non_edges, G, features, embedding_map, operator, cat_threshold)
 
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
@@ -593,9 +701,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Test =====
     X_test_pos, _ = build_feature_matrix(
-        test_edges, G, features, embedding_map, operator)
+        test_edges, G, features, embedding_map, operator, cat_threshold)
     X_test_neg, _ = build_feature_matrix(
-        test_non_edges, G, features, embedding_map, operator)
+        test_non_edges, G, features, embedding_map, operator, cat_threshold)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     y_test = np.concatenate([
