@@ -390,7 +390,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
         'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
-        'cat_same'  - simplified same/different category feature for baseline comparison
+        'catsame'  - simplified same/different category feature for baseline comparison
         'cbg'       - binary for same/different census-block group
         'comm'      - binary for same/different infomap community
         'ls'        - concatenated embeddings from endpoint categories constructed from word2vec on activity sequences
@@ -483,7 +483,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
         vocab = sorted(p for p, cnt in pair_counts.items()
                        if cnt >= cat_threshold)
         print(
-            f'# kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({(len(vocab)/210)*100}%)')
+            f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
         pair_to_idx = {p: i for i, p in enumerate(vocab)}
 
         cat_feat = np.zeros((len(U), len(vocab)))
@@ -497,7 +497,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
 
         feature_blocks.append(cat_feat)
 
-    if 'cat_same' in features:
+    if 'catsame' in features:
         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
 
