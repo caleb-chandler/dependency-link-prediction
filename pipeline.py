@@ -33,34 +33,35 @@ def load(fpath, compress=False):
         df,
         source='ORIGIN',
         target='DESTINATION',
-        edge_attr=['N_COVISITS', 'DIST_KM', 'DEP'],
+        edge_attr=['DIST_KM', 'DEP'],
     )
+
     # assign node attrs
     origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
                   'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
-    origins.columns = ['node_id', 'lat', 'lng',
-                       'taxonomy', 'unique_visits', 'total_visits']
+    # FIX: Align columns directly to match expected attributes ('latitude', 'longitude', 'poi_type')
+    origins.columns = ['node_id', 'latitude', 'longitude',
+                       'poi_type', 'unique_visits', 'total_visits']
+
     destinations = df[['DESTINATION', 'LAT_DESTINATION',
                        'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
                        'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
-    destinations.columns = ['node_id', 'lat', 'lng',
-                            'taxonomy', 'unique_visits', 'total_visits']
+    # FIX: Align columns directly to match expected attributes
+    destinations.columns = ['node_id', 'latitude', 'longitude',
+                            'poi_type', 'unique_visits', 'total_visits']
 
     # combine them into one master list of unique POIs
     node_data = pd.concat([origins, destinations]).drop_duplicates(
         'node_id').set_index('node_id')
 
     # map back to graph - convert to dict and apply
-    lat_dict = node_data['lat'].to_dict()
-    lng_dict = node_data['lng'].to_dict()
-    tax_dict = node_data['taxonomy'].to_dict()
-    uv_dict = node_data['unique_visits'].to_dict()
-    tv_dict = node_data['total_visits'].to_dict()
-    nx.set_node_attributes(G, lat_dict, 'latitude')
-    nx.set_node_attributes(G, lng_dict, 'longitude')
-    nx.set_node_attributes(G, tax_dict, 'poi_type')
-    nx.set_node_attributes(G, uv_dict, 'unique_visits')
-    nx.set_node_attributes(G, tv_dict, 'total_visits')
+    nx.set_node_attributes(G, node_data['latitude'].to_dict(), 'latitude')
+    nx.set_node_attributes(G, node_data['longitude'].to_dict(), 'longitude')
+    nx.set_node_attributes(G, node_data['poi_type'].to_dict(), 'poi_type')
+    nx.set_node_attributes(
+        G, node_data['unique_visits'].to_dict(), 'unique_visits')
+    nx.set_node_attributes(
+        G, node_data['total_visits'].to_dict(), 'total_visits')
 
     print(f"Nodes: {G.number_of_nodes()}")
     print(f"Edges: {G.number_of_edges()}")
@@ -124,10 +125,6 @@ def distribution_finder(G, bins=50):
 
     dist_distr, dist_edges_set = get_binned_dist(dist_dict, custom_bins)
 
-    # --- edges: covisits (continuous/discrete) ---
-    cv_dict = nx.get_edge_attributes(G, 'N_COVISITS')
-    cv_distr, cv_edges_set = get_binned_dist(cv_dict, bins)
-
     # --- nodes: categorical (poi type) ---
     type_dict = {u: data.get('poi_type', 'Unknown')
                  for u, data in G.nodes(data=True)}
@@ -148,9 +145,9 @@ def distribution_finder(G, bins=50):
     deg_distr, deg_nodes_set = get_discrete_dist(deg_dict)
 
     # pack the results logically so it's easy to return
-    distributions = (dist_distr, cv_distr, type_distr,
+    distributions = (dist_distr, type_distr,
                      uv_distr, tv_distr, deg_distr)
-    element_sets = (dist_edges_set, cv_edges_set, type_nodes_set,
+    element_sets = (dist_edges_set, type_nodes_set,
                     uv_nodes_set, tv_nodes_set, deg_nodes_set)
 
     return distributions, element_sets
@@ -260,7 +257,7 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
     seed (int, optional): Seed for reproducibility.
 
     Returns:
-    nx.Graph : original graph
+    nx.Graph : original graph if metadata needed for pipeline
     list : list of negative training samples
     list : list of positive testing samples
     list : list of negative testing samples
@@ -332,7 +329,10 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
-    return G, train_non_edges, test_edges, test_non_edges
+    if meta:
+        return G, train_non_edges, test_edges, test_non_edges
+    else:
+        return train_non_edges, test_edges, test_non_edges
 
 # ====================================================================
 
@@ -661,10 +661,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         for i, node_id in enumerate(g.nodes):
             if node_id is None:
                 continue
-            try:
-                key = int(node_id)
-            except (ValueError, TypeError):
-                key = node_id
+            # FIX: Force node_id to string to maintain consistency with graph node IDs
+            key = str(node_id)
             embedding_map[key] = embeddings[i].tolist()
 
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
