@@ -43,7 +43,7 @@ def load(fpath, compress=False):
         df,
         source='ORIGIN',
         target='DESTINATION',
-        edge_attr=['DIST_KM', 'DEP'],
+        edge_attr=['DIST_KM', 'DEP', 'N_COVISITS'],
     )
 
     # assign node attrs
