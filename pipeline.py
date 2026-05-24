@@ -16,10 +16,20 @@ from infomap import Infomap
 
 
 def load(fpath, compress=False):
-    df = pd.read_csv(fpath, sep='\s+', names=['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
-                                              'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
-                                              'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
-                                              'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP'])
+    _cols = ['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
+             'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
+             'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
+             'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP']
+    _dtypes = {
+        'ORIGIN': 'category', 'DESTINATION': 'category',
+        'TAXONOMY_ORIGIN': 'category', 'TAXONOMY_DESTINATION': 'category',
+        'N_COVISITS': 'float32', 'LAT_ORIGIN': 'float32', 'LNG_ORIGIN': 'float32',
+        'LAT_DESTINATION': 'float32', 'LNG_DESTINATION': 'float32',
+        'DIST_KM': 'float32', 'N_UIDS_ORIGIN': 'float32', 'N_VISITS_ORIGIN': 'float32',
+        'N_UIDS_DESTINATION': 'float32', 'N_VISITS_DESTINATION': 'float32',
+        'DEP': 'float32',
+    }
+    df = pd.read_csv(fpath, sep='\s+', names=_cols, dtype=_dtypes)
 
     # optional log-compression
     if compress:
@@ -38,14 +48,14 @@ def load(fpath, compress=False):
 
     # assign node attrs
     origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
-                  'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
+                  'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].dropna().drop_duplicates()
     # FIX: Align columns directly to match expected attributes ('latitude', 'longitude', 'poi_type')
     origins.columns = ['node_id', 'latitude', 'longitude',
                        'poi_type', 'unique_visits', 'total_visits']
 
     destinations = df[['DESTINATION', 'LAT_DESTINATION',
                        'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
-                       'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
+                       'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].dropna().drop_duplicates()
     # FIX: Align columns directly to match expected attributes
     destinations.columns = ['node_id', 'latitude', 'longitude',
                             'poi_type', 'unique_visits', 'total_visits']
@@ -243,7 +253,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None):
+def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None, meta=None):
     """
     Prepare data for link prediction pipeline.
 
@@ -347,8 +357,8 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def assign_cbg_to_nodes(G, shapefile_path):
-    """Add 'cbg' attribute to each node in G via spatial join."""
+def node_to_area(G, shapefile_path='data/cbg/tl_2025_25_bg.shp'):
+    """Add 'cbg' + 'tract' attribute to each node in G via spatial join."""
     nodes = list(G.nodes())
     lats = [G.nodes[n].get('latitude', 0) for n in nodes]
     lngs = [G.nodes[n].get('longitude', 0) for n in nodes]
@@ -363,10 +373,13 @@ def assign_cbg_to_nodes(G, shapefile_path):
     joined = gpd.sjoin(poi_gdf, cbg_gdf, how='left', predicate='within')
 
     for _, row in joined.iterrows():
-        G.nodes[row['node_id']]['cbg'] = row.get('GEOID', 'Unknown')
+        geoid = row.get('GEOID')
+        geoid = geoid if pd.notna(geoid) else None
+        G.nodes[row['node_id']]['cbg'] = geoid if geoid else 'Unknown'
+        G.nodes[row['node_id']]['tract'] = geoid[:11] if geoid else 'Unknown'
 
 
-def assign_node_to_comm(G):
+def node_to_comm(G):
     im = Infomap("--num-trials 20")
     im_to_nx = im.add_networkx_graph(G, weight='N_COVISITS')
     print("Running Infomap...")
@@ -671,10 +684,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
     if 'cbg' in features:
-        assign_cbg_to_nodes(G, 'data/cbg/tl_2025_25_bg.shp')
+        node_to_area(G, 'data/cbg/tl_2025_25_bg.shp')
 
     if 'comm' in features:
-        assign_node_to_comm(G)
+        node_to_comm(G)
 
     X_train_pos, _ = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold)
