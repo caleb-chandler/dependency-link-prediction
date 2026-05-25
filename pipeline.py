@@ -14,6 +14,10 @@ import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
 
+# ===================================================================
+# GRAPH LOADING FUNCTION
+# ===================================================================
+
 
 def load(fpath, compress=False):
     _cols = ['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
@@ -77,6 +81,9 @@ def load(fpath, compress=False):
     print(f"Edges: {G.number_of_edges()}")
     return G
 
+
+# ================================================================
+# DISTANCE-CONTROLLED SAMPLING
 # ================================================================
 
 
@@ -161,8 +168,6 @@ def distribution_finder(G, bins=50):
                     uv_nodes_set, tv_nodes_set, deg_nodes_set)
 
     return distributions, element_sets
-
-# ===================================================================
 
 
 def sample_non_edges_dist_controlled(G, distr, total_count):
@@ -250,10 +255,13 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
 
     return list(non_edges)
 
+
+# ====================================================================
+# PREPARE_DATA
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None, meta=None):
+def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None):
     """
     Prepare data for link prediction pipeline.
 
@@ -299,11 +307,16 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None, meta=None)
         elif weight == 'cov':
             G_train.add_weighted_edges_from(
                 [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
+        elif weight == 'num_occ' and agg:
+            G_train.add_weighted_edges_from(
+                [(u, v, G[u][v]['weight']) for u, v in train_edges])
         else:
             G_train.add_edges_from(train_edges)
+            if weight == 'num_occ' and agg == False:
+                print("weight = 'num_occ' failed: Aggregated network not used.")
 
         # sample non-edges by bin to preserve distribution
-        distrs, sets = distribution_finder(G)
+        distrs, _ = distribution_finder(G)
         dist_bins = distrs[0]  # distance dict
 
         # getting true negatives (overlap possible but very improbable for large datasets)
@@ -314,7 +327,11 @@ def prepare_data(fpath, frac=0.5, seed=None, compress=0, weight=None, meta=None)
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
-    G = load(fpath, compress=compress)
+    if agg:
+        df = pd.read_csv(fpath, header=None)
+        G = nx.from_pandas_edgelist(df, source=0, target=1, edge_attr=True)
+    else:
+        G = load(fpath, compress=compress)
 
     # failsafe
     if G.number_of_nodes() == 0:
@@ -354,6 +371,9 @@ BINARY_OPERATORS = {
     'w-l2': lambda a, b: np.square(np.subtract(a, b)),
 }
 
+
+# ===================================================================
+# METADATA FEATURE INCLUSION
 # ===================================================================
 
 
@@ -541,6 +561,9 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
 
     return X, kept_indices
 
+
+# ===================================================================
+# RUN_PIPELINE
 # ====================================================================
 
 
@@ -603,7 +626,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         random.seed(seed)
         np.random.seed(seed)
 
-    if features == 'all':
+    if features == 'all' or features == ['all']:
         features = ['emb', 'geo', 'cat', 'cbg', 'comm']
 
     # ===== Validation =====
