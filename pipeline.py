@@ -13,6 +13,7 @@ from sklearn.neighbors import BallTree
 import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
+from scipy.spatial.distance import jensenshannon
 
 # ===================================================================
 # GRAPH LOADING FUNCTION
@@ -419,6 +420,31 @@ def node_to_comm(G):
         f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
 
 
+def add_outside_metadata(G):
+    df_temporal = pd.read_csv('data/metadata/temporal_sig.csv.gz')
+    df_income = pd.read_csv(
+        'data/metadata/income_sig.csv', compression='gzip')
+
+    # remove and renormalize nulls for income
+    income_cols = ['1', '2', '3', '4']
+    df_income[income_cols] = df_income[income_cols].div(
+        df_income[income_cols].sum(axis=1), axis=0)
+    df_income.drop(columns='NULL', inplace=True)
+
+    # combine dfs
+    df_temporal.set_index('POI_ID', inplace=True)
+    df_income.set_index('POI_ID', inplace=True)
+    df_features = df_temporal.join(df_income)
+
+    # add to node attrs
+    for poi_id in G.nodes():
+        if poi_id in df_features.index:
+            G.nodes[poi_id]['time_dist'] = df_features.loc[poi_id,
+                                                           ['0', '6', '12', '18']].values
+            G.nodes[poi_id]['inc_dist'] = df_features.loc[poi_id,
+                                                          ['1', '2', '3', '4']].values
+
+
 def build_feature_matrix(
         edges, G, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
 ):
@@ -431,10 +457,12 @@ def build_feature_matrix(
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
         'geo'       – log geographic distance in km  (1-d)
         'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
-        'catsame'  - simplified same/different category feature for baseline comparison
+        'catsame'   - simplified same/different category feature for baseline comparison
         'cbg'       - binary for same/different census-block group
         'comm'      - binary for same/different infomap community
         'ls'        - concatenated embeddings from endpoint categories constructed from word2vec on activity sequences
+        'time'      - JS divergence of 6hr-window temporal distribution of visits for endpoint POIs
+        'income'    - JS divergence of income-quartile distribution of endpoint POI visitors
 
     Parameters
     ----------
@@ -553,7 +581,7 @@ def build_feature_matrix(
         cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
                     ).astype(float).reshape(-1, 1)
         feature_blocks.append(cbg_feat)
-    else:
+    elif 'cbg' in features and agg:
         print('Feature "cbg" invalid for aggregated network. Skipping.')
 
     if 'comm' in features:
@@ -565,6 +593,45 @@ def build_feature_matrix(
 
     if 'ls' in features:
         pass
+
+    if 'time' in features or 'income' in features:
+        add_outside_metadata(G)
+        # uniform distribution for fallback
+        default_distr = np.array([0.25, 0.25, 0.25, 0.25])
+        if not 'time' in features:
+            # add only income
+            inc_u = np.array(
+                [G.nodes[u].get('inc_dist', default_distr) for u in U])
+            inc_v = np.array(
+                [G.nodes[v].get('inc_dist', default_distr) for v in V])
+            js_dist = jensenshannon(inc_u, inc_v, axis=1)
+            inc_feat = (js_dist ** 2).reshape(-1, 1)
+            feature_blocks.append(inc_feat)
+        elif not 'income' in features:
+            # add only time
+            time_u = np.array(
+                [G.nodes[u].get('time_dist', default_distr) for u in U])
+            time_v = np.array(
+                [G.nodes[v].get('time_dist', default_distr) for v in V])
+            js_dist = jensenshannon(time_u, time_v, axis=1)
+            time_feat = (js_dist ** 2).reshape(-1, 1)
+            feature_blocks.append(time_feat)
+        else:
+            # add both
+            inc_u = np.array(
+                [G.nodes[u].get('inc_dist', default_distr) for u in U])
+            inc_v = np.array(
+                [G.nodes[v].get('inc_dist', default_distr) for v in V])
+            js_dist = jensenshannon(inc_u, inc_v, axis=1)
+            inc_feat = (js_dist ** 2).reshape(-1, 1)
+            feature_blocks.append(inc_feat)
+            time_u = np.array(
+                [G.nodes[u].get('time_dist', default_distr) for u in U])
+            time_v = np.array(
+                [G.nodes[v].get('time_dist', default_distr) for v in V])
+            js_dist = jensenshannon(time_u, time_v, axis=1)
+            time_feat = (js_dist ** 2).reshape(-1, 1)
+            feature_blocks.append(time_feat)
 
     # Assemble the Final Matrix
     # Horizontally stack all requested feature blocks into a single matrix
