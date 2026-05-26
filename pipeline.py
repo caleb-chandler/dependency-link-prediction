@@ -88,7 +88,7 @@ def load(fpath, compress=False):
 
 
 def distribution_finder(G, bins=50):
-    # --- helper: continuous data (bins ---)
+    # --- helper: continuous data (bins) ---
     def get_binned_dist(data_dict, bins):
         if not data_dict:
             return pd.Series(dtype='float64'), {}
@@ -218,13 +218,18 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
                 # pick a random source node
                 u_idx = random.randint(0, len(nodes) - 1)
                 u = nodes[u_idx]
+                # converts to 2d (table with 1 row and 2 columns instead of just single row)
                 u_coord = coords[u_idx:u_idx+1]
 
                 # query the tree for nodes within the outer radius
                 indices_within_max = tree.query_radius(u_coord, r=r_max)[0]
 
-                # query the tree for nodes within the inner radius
-                indices_within_min = tree.query_radius(u_coord, r=r_min)[0]
+                # when d_min == 0, query_radius(r=0) returns all co-located nodes,
+                # which would incorrectly exclude valid same-location candidates
+                if d_min_km == 0:
+                    indices_within_min = np.array([u_idx])
+                else:
+                    indices_within_min = tree.query_radius(u_coord, r=r_min)[0]
 
                 # set difference gives us the nodes existing strictly in the target distance ring
                 valid_indices = np.setdiff1d(
@@ -328,8 +333,9 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
         return G_train, test_edges, test_non_edges, train_non_edges
 
     if agg:
-        df = pd.read_csv(fpath, header=None)
-        G = nx.from_pandas_edgelist(df, source=0, target=1, edge_attr=True)
+        import pickle
+        with open(fpath, 'rb') as f:
+            G = pickle.load(f)
     else:
         G = load(fpath, compress=compress)
 
@@ -377,7 +383,7 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def node_to_area(G, shapefile_path='data/cbg/tl_2025_25_bg.shp'):
+def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
     """Add 'cbg' + 'tract' attribute to each node in G via spatial join."""
     nodes = list(G.nodes())
     lats = [G.nodes[n].get('latitude', 0) for n in nodes]
@@ -413,7 +419,9 @@ def node_to_comm(G):
         f"Assigned {len(set(nx.get_node_attributes(G, 'community').values()))} communities")
 
 
-def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard', cat_threshold=1):
+def build_feature_matrix(
+        edges, G, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
+):
     """
     Build a feature matrix for a list of node pairs.
 
@@ -435,6 +443,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
     features : list of str
     embedding_map : dict  (required only when 'emb' in features)
     operator : str  (which binary operator to use for embeddings)
+    agg : bool (flag for agg network type)
 
     Returns
     -------
@@ -538,12 +547,14 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
         feature_blocks.append(cat_feat)
 
-    if 'cbg' in features:
+    if 'cbg' in features and agg == False:
         cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
         cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
         cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
                     ).astype(float).reshape(-1, 1)
         feature_blocks.append(cbg_feat)
+    else:
+        print('Feature "cbg" invalid for aggregated network. Skipping.')
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
@@ -568,7 +579,7 @@ def build_feature_matrix(edges, G, features, embedding_map, operator='hadamard',
 
 
 def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
-                 mode='PreComp', operator='hadamard', **kwargs):
+                 mode='PreComp', operator='hadamard', agg=False, **kwargs):
     """
     Run the link prediction pipeline with flexible feature composition. Features are controlled by the `features` list.
 
@@ -697,7 +708,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         for i, node_id in enumerate(g.nodes):
             if node_id is None:
                 continue
-            # FIX: Force node_id to string to maintain consistency with graph node IDs
+            # Force node_id to string to maintain consistency with graph node IDs
             key = str(node_id)
             embedding_map[key] = embeddings[i].tolist()
 
@@ -706,16 +717,16 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # ===== Assemble feature matrices =====
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
-    if 'cbg' in features:
+    if 'cbg' in features or 'tract' in features and agg == False:
         node_to_area(G, 'data/cbg/tl_2025_25_bg.shp')
 
     if 'comm' in features:
         node_to_comm(G)
 
     X_train_pos, _ = build_feature_matrix(
-        train_pos_edges, G, features, embedding_map, operator, cat_threshold)
+        train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
     X_train_neg, _ = build_feature_matrix(
-        train_non_edges, G, features, embedding_map, operator, cat_threshold)
+        train_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
@@ -737,9 +748,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Test =====
     X_test_pos, _ = build_feature_matrix(
-        test_edges, G, features, embedding_map, operator, cat_threshold)
+        test_edges, G, features, embedding_map, operator, cat_threshold, agg)
     X_test_neg, _ = build_feature_matrix(
-        test_non_edges, G, features, embedding_map, operator, cat_threshold)
+        test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     y_test = np.concatenate([
