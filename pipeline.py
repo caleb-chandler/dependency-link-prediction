@@ -5,7 +5,6 @@ from pecanpy import pecanpy as n2v
 import random
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
-from scipy.io import loadmat
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
@@ -595,7 +594,6 @@ def build_feature_matrix(
         pass
 
     if 'time' in features or 'income' in features:
-        add_outside_metadata(G)
         # uniform distribution for fallback
         default_distr = np.array([0.25, 0.25, 0.25, 0.25])
         if not 'time' in features:
@@ -705,10 +703,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.random.seed(seed)
 
     if features == 'all' or features == ['all']:
-        features = ['emb', 'geo', 'cat', 'cbg', 'comm']
+        features = ['emb', 'geo', 'cat', 'cbg', 'comm', 'time', 'income']
 
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm'} & set(features))
+    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm', 'time', 'income'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
             "Graph G with node attributes is required when features "
@@ -784,11 +782,14 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # ===== Assemble feature matrices =====
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
-    if 'cbg' in features or 'tract' in features and agg == False:
+    if ('cbg' in features or 'tract' in features) and not agg:
         node_to_area(G, 'data/cbg/tl_2025_25_bg.shp')
 
     if 'comm' in features:
         node_to_comm(G)
+
+    if 'time' in features or 'income' in features:
+        add_outside_metadata(G)
 
     X_train_pos, _ = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
