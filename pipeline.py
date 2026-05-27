@@ -130,8 +130,9 @@ def distribution_finder(G, bins=50):
 
     # --- edges: distance (continuous) ---
     dist_dict = nx.get_edge_attributes(G, 'DIST_KM')
-    if dist_dict:
-        max_d = max(dist_dict.values())
+    dist_values = [v for v in dist_dict.values() if v is not None]
+    if dist_values:
+        max_d = max(dist_values)
         if max_d > 0.01:
             # Create logarithmic bins: start with 0, then exponentially space from 0.01km (10m) to max_d
             custom_bins = np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
@@ -140,7 +141,8 @@ def distribution_finder(G, bins=50):
     else:
         custom_bins = bins
 
-    dist_distr, dist_edges_set = get_binned_dist(dist_dict, custom_bins)
+    dist_distr, dist_edges_set = get_binned_dist(
+        {k: v for k, v in dist_dict.items() if v is not None}, custom_bins)
 
     # --- nodes: categorical (poi type) ---
     type_dict = {u: data.get('poi_type', 'Unknown')
@@ -171,10 +173,18 @@ def distribution_finder(G, bins=50):
 
 
 def sample_non_edges_dist_controlled(G, distr, total_count):
+    def _coord(attrs, *keys):
+        for k in keys:
+            v = attrs.get(k)
+            if v is not None:
+                return float(v)
+        return 0.0
+
     # extract coordinates and build a spatial index
     nodes = list(G.nodes())
     coords = np.radians([
-        [G.nodes[n].get('latitude', 0), G.nodes[n].get('longitude', 0)]
+        [_coord(G.nodes[n], 'latitude', 'lat'),
+         _coord(G.nodes[n], 'longitude', 'lon')]
         for n in nodes
     ])
 
@@ -261,12 +271,121 @@ def sample_non_edges_dist_controlled(G, distr, total_count):
     return list(non_edges)
 
 
+def sample_non_edges_fast_dist_controlled(G, distr, total_count, batch_size=2_000_000):
+    """
+    Fast distance-controlled non-edge sampler for large graphs (>1M edges).
+    Uses bulk random pair generation + vectorized haversine instead of per-bin BallTree queries.
+    Short-distance bins may be underfilled when locally dense clusters are fully connected,
+    but this also occurs in the BallTree sampler and the affected fraction is tiny.
+    """
+    def _coord(attrs, *keys):
+        for k in keys:
+            v = attrs.get(k)
+            if v is not None:
+                return float(v)
+        return 0.0
+
+    nodes = list(G.nodes())
+    n = len(nodes)
+    node_to_idx = {nd: i for i, nd in enumerate(nodes)}
+
+    lat = np.array([_coord(G.nodes[nd], 'latitude', 'lat')
+                   for nd in nodes], dtype=np.float64)
+    lng = np.array([_coord(G.nodes[nd], 'longitude', 'lon')
+                   for nd in nodes], dtype=np.float64)
+
+    # Integer-keyed edge set for faster hashing than string tuples
+    edge_set_int = set()
+    for u, v in G.edges():
+        ui, vi = node_to_idx[u], node_to_idx[v]
+        edge_set_int.add((ui, vi) if ui < vi else (vi, ui))
+
+    bin_intervals = list(distr.index)
+    n_bins = len(bin_intervals)
+    bin_edges = np.array([bin_intervals[0].left] +
+                         [iv.right for iv in bin_intervals])
+
+    total_in_distr = distr.sum()
+    bin_quotas = np.array([
+        int(np.round((c / total_in_distr) * total_count)) for c in distr.values
+    ], dtype=int)
+
+    bin_results = [[] for _ in range(n_bins)]
+    bin_filled = np.zeros(n_bins, dtype=int)
+    prev_filled = -1
+    stall_rounds = 0
+
+    with tqdm(total=total_count, desc='Sampling non-edges (fast)', unit='edge', leave=False) as pbar:
+        while bin_filled.sum() < total_count:
+            still_needed = np.maximum(bin_quotas - bin_filled, 0)
+            if still_needed.sum() == 0:
+                break
+
+            cur_filled = int(bin_filled.sum())
+            if cur_filled == prev_filled:
+                stall_rounds += 1
+                if stall_rounds >= 5:
+                    break
+            else:
+                stall_rounds = 0
+            prev_filled = cur_filled
+
+            ui = np.random.randint(0, n, batch_size)
+            vi = np.random.randint(0, n, batch_size)
+            mask = ui != vi
+            ui, vi = ui[mask], vi[mask]
+
+            lat_u = np.radians(lat[ui])
+            lat_v = np.radians(lat[vi])
+            lng_u = np.radians(lng[ui])
+            lng_v = np.radians(lng[vi])
+            dlat = lat_v - lat_u
+            dlng = lng_v - lng_u
+            a = np.sin(dlat / 2) ** 2 + np.cos(lat_u) * \
+                np.cos(lat_v) * np.sin(dlng / 2) ** 2
+            dist = 6371.0088 * 2 * \
+                np.arctan2(np.sqrt(np.clip(a, 0.0, 1.0)),
+                           np.sqrt(np.clip(1.0 - a, 0.0, 1.0)))
+
+            b_idx = np.digitize(dist, bins=bin_edges) - 1
+            in_range = (b_idx >= 0) & (b_idx < n_bins)
+
+            for b in range(n_bins):
+                need = still_needed[b]
+                if need <= 0:
+                    continue
+                candidates = np.where(in_range & (b_idx == b))[0]
+                if len(candidates) == 0:
+                    continue
+                np.random.shuffle(candidates)
+                added = 0
+                for k in candidates:
+                    if added >= need:
+                        break
+                    u_i, v_i = int(ui[k]), int(vi[k])
+                    edge_int = (u_i, v_i) if u_i < v_i else (v_i, u_i)
+                    if edge_int not in edge_set_int:
+                        edge_set_int.add(edge_int)
+                        bin_results[b].append((nodes[u_i], nodes[v_i]))
+                        bin_filled[b] += 1
+                        added += 1
+                        pbar.update(1)
+
+    for b in range(n_bins):
+        if bin_filled[b] < bin_quotas[b]:
+            iv = bin_intervals[b]
+            print(
+                f"Warning: Could not fulfill quota for bin [{iv.left:.2f}, {iv.right:.2f}]. Got {bin_filled[b]}/{bin_quotas[b]}.")
+
+    return [edge for bucket in bin_results for edge in bucket]
+
+
 # ====================================================================
 # PREPARE_DATA
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None):
+def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None, trainfile='train.txt'):
     """
     Prepare data for link prediction pipeline.
 
@@ -325,10 +444,9 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
         dist_bins = distrs[0]  # distance dict
 
         # getting true negatives (overlap possible but very improbable for large datasets)
-        test_non_edges = sample_non_edges_dist_controlled(
-            G, dist_bins, len(test_edges))
-        train_non_edges = sample_non_edges_dist_controlled(
-            G, dist_bins, len(train_edges))
+        sampler = sample_non_edges_fast_dist_controlled if agg else sample_non_edges_dist_controlled
+        test_non_edges = sampler(G, dist_bins, len(test_edges))
+        train_non_edges = sampler(G, dist_bins, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
@@ -356,9 +474,9 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
         return None
 
     # saving training graph
-    with open('train.txt', 'w') as f:
+    with open(trainfile, 'w') as f:
         for u, v, d in G_train.edges(data=True):
-            f.write(f"{u} {v} {d.get('weight', 1.0)}\n")
+            f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
@@ -427,7 +545,7 @@ def add_outside_metadata(G):
     # remove and renormalize nulls for income
     income_cols = ['1', '2', '3', '4']
     df_income[income_cols] = df_income[income_cols].div(
-        df_income[income_cols].sum(axis=1), axis=0)
+        df_income[income_cols].sum(axis=1), axis=0).fillna(0.25)
     df_income.drop(columns='NULL', inplace=True)
 
     # combine dfs
@@ -514,10 +632,10 @@ def build_feature_matrix(
     # 3. Vectorized Geographic Distance (Pure NumPy Haversine)
     if 'geo' in features:
         # Fast extraction using list comprehensions (dict lookups are fast, math is slow)
-        lat_u = np.array([G.nodes[u].get('latitude', 0) for u in U])
-        lng_u = np.array([G.nodes[u].get('longitude', 0) for u in U])
-        lat_v = np.array([G.nodes[v].get('latitude', 0) for v in V])
-        lng_v = np.array([G.nodes[v].get('longitude', 0) for v in V])
+        lat_u = np.array([G.nodes[u].get('latitude') or 0.0 for u in U], dtype=np.float64)
+        lng_u = np.array([G.nodes[u].get('longitude') or 0.0 for u in U], dtype=np.float64)
+        lat_v = np.array([G.nodes[v].get('latitude') or 0.0 for v in V], dtype=np.float64)
+        lng_v = np.array([G.nodes[v].get('longitude') or 0.0 for v in V], dtype=np.float64)
 
         # Convert all coordinates to radians at once
         lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
@@ -631,9 +749,7 @@ def build_feature_matrix(
             time_feat = (js_dist ** 2).reshape(-1, 1)
             feature_blocks.append(time_feat)
 
-    # Assemble the Final Matrix
-    # Horizontally stack all requested feature blocks into a single matrix
-    X = np.hstack(feature_blocks)
+    X = np.hstack(feature_blocks).astype(np.float32)
 
     return X, kept_indices
 
@@ -702,11 +818,16 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         random.seed(seed)
         np.random.seed(seed)
 
-    if features == 'all' or features == ['all']:
-        features = ['emb', 'geo', 'cat', 'cbg', 'comm', 'time', 'income']
+    if not agg:
+        if features == 'all' or features == ['all']:
+            features = ['emb', 'geo', 'cat', 'cbg', 'comm', 'time', 'income']
+    else:
+        if features == 'all' or features == ['all']:
+            features = ['emb', 'geo', 'cat', 'comm']
 
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm', 'time', 'income'} & set(features))
+    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm',
+                          'time', 'income'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
             "Graph G with node attributes is required when features "
@@ -714,7 +835,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         )
 
     # converting training graph to nx.Graph object
-    G_train = nx.read_edgelist(trainfile, data=[('weight', float)])
+    G_train = nx.read_edgelist(trainfile, data=[('weight', float)], delimiter='\t')
 
     # ===== Embedding generation (only if needed) =====
 
@@ -747,7 +868,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             try:
                 g = make_pecanpy_graph(candidate_mode, weighted)
                 g.read_edg(trainfile, weighted=weighted,
-                           directed=directed, delimiter=' ')
+                           directed=directed, delimiter='\t')
                 if candidate_mode == 'PreComp':
                     g.preprocess_transition_probs()
 
@@ -783,7 +904,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
     if ('cbg' in features or 'tract' in features) and not agg:
-        node_to_area(G, 'data/cbg/tl_2025_25_bg.shp')
+        node_to_area(G)
 
     if 'comm' in features:
         node_to_comm(G)
@@ -801,6 +922,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.ones(len(X_train_pos)),
         np.zeros(len(X_train_neg))
     ])
+    del X_train_pos, X_train_neg
 
     # shuffle
     shuffle_idx = np.random.permutation(len(y_train))
