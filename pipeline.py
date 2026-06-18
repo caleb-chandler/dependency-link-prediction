@@ -424,20 +424,31 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
         # build training graph
         G_train = nx.Graph()
         G_train.add_nodes_from(G.nodes())
+
         # handle weights or not
-        if weight == 'dep':
-            G_train.add_weighted_edges_from(
-                [(u, v, G[u][v]['DEP']) for u, v in train_edges])
-        elif weight == 'cov':
-            G_train.add_weighted_edges_from(
-                [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
-        elif weight == 'num_occ' and agg:
-            G_train.add_weighted_edges_from(
-                [(u, v, G[u][v]['weight']) for u, v in train_edges])
-        else:
+        if not weight:
             G_train.add_edges_from(train_edges)
-            if weight == 'num_occ' and agg == False:
-                print("weight = 'num_occ' failed: Aggregated network not used.")
+        elif not agg:
+            if weight == 'dep':
+                G_train.add_weighted_edges_from(
+                    [(u, v, G[u][v]['DEP']) for u, v in train_edges])
+            elif weight == 'cov':
+                G_train.add_weighted_edges_from(
+                    [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
+            else:
+                # fallback for invalid weights when agg is False
+                print(
+                    f'Value "{weight}" not recognized when agg=False. Falling back to unweighted.')
+                G_train.add_edges_from(train_edges)
+        else:
+            if weight == 'num_occ':
+                G_train.add_weighted_edges_from(
+                    [(u, v, G[u][v]['weight']) for u, v in train_edges])
+            else:
+                # fallback for invalid weights when agg is True
+                print(
+                    f'Value "{weight}" not recognized when agg=True. Falling back to unweighted.')
+                G_train.add_edges_from(train_edges)
 
         # sample non-edges by bin to preserve distribution
         distrs, _ = distribution_finder(G)
@@ -598,7 +609,7 @@ def build_feature_matrix(
     """
     op_fn = BINARY_OPERATORS[operator]
 
-    # 1. Pre-filter edges missing embeddings to ensure matrix shapes align later
+    # Pre-filter edges missing embeddings to ensure matrix shapes align later
     valid_edges = []
     kept_indices = []
 
@@ -619,7 +630,7 @@ def build_feature_matrix(
 
     feature_blocks = []
 
-    # 2. Vectorized Embedding Operations
+    # Vectorized Embedding Operations
     if 'emb' in features:
         # Extract to 2D arrays: shape (N, 128)
         emb_u = np.array([embedding_map[u] for u in U])
@@ -629,13 +640,63 @@ def build_feature_matrix(
         emb_feat = op_fn(emb_u, emb_v)
         feature_blocks.append(emb_feat)
 
-    # 3. Vectorized Geographic Distance (Pure NumPy Haversine)
+    if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
+        if 'cat' in features:
+            # Count each undirected type-pair across all edges in G
+            pair_counts = {}
+            for eu, ev in G.edges():
+                cu = G.nodes[eu].get('poi_type', 'Unknown')
+                cv = G.nodes[ev].get('poi_type', 'Unknown')
+                pair = tuple(sorted([cu, cv]))
+                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+
+            # Vocabulary: only pairs observed >= cat_threshold times, sorted for stable columns
+            vocab = sorted(p for p, cnt in pair_counts.items()
+                           if cnt >= cat_threshold)
+            print(
+                f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
+            pair_to_idx = {p: i for i, p in enumerate(vocab)}
+
+            cat_feat = np.zeros((len(U), len(vocab)))
+            for i, (u, v) in enumerate(zip(U, V)):
+                cu = G.nodes[u].get('poi_type', 'Unknown')
+                cv = G.nodes[v].get('poi_type', 'Unknown')
+                pair = tuple(sorted([cu, cv]))
+                idx = pair_to_idx.get(pair)
+                if idx is not None:
+                    cat_feat[i, idx] = 1.0
+
+            feature_blocks.append(cat_feat)
+
+        if 'catsame' in features:
+            cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
+            cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
+
+            # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
+            cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
+            feature_blocks.append(cat_feat)
+
+        if 'cbg' in features:
+            cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
+            cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
+            cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
+                        ).astype(float).reshape(-1, 1)
+            feature_blocks.append(cbg_feat)
+    else:
+        print(
+            'Category and census-based features invalid for aggregated network. Skipping.')
+
+    # vectorized geographic distance
     if 'geo' in features:
         # Fast extraction using list comprehensions (dict lookups are fast, math is slow)
-        lat_u = np.array([G.nodes[u].get('latitude') or 0.0 for u in U], dtype=np.float64)
-        lng_u = np.array([G.nodes[u].get('longitude') or 0.0 for u in U], dtype=np.float64)
-        lat_v = np.array([G.nodes[v].get('latitude') or 0.0 for v in V], dtype=np.float64)
-        lng_v = np.array([G.nodes[v].get('longitude') or 0.0 for v in V], dtype=np.float64)
+        lat_u = np.array([G.nodes[u].get('latitude')
+                         or 0.0 for u in U], dtype=np.float64)
+        lng_u = np.array([G.nodes[u].get('longitude')
+                         or 0.0 for u in U], dtype=np.float64)
+        lat_v = np.array([G.nodes[v].get('latitude')
+                         or 0.0 for v in V], dtype=np.float64)
+        lng_v = np.array([G.nodes[v].get('longitude')
+                         or 0.0 for v in V], dtype=np.float64)
 
         # Convert all coordinates to radians at once
         lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
@@ -657,50 +718,6 @@ def build_feature_matrix(
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
 
-    if 'cat' in features:
-        # Count each undirected type-pair across all edges in G
-        pair_counts = {}
-        for eu, ev in G.edges():
-            cu = G.nodes[eu].get('poi_type', 'Unknown')
-            cv = G.nodes[ev].get('poi_type', 'Unknown')
-            pair = tuple(sorted([cu, cv]))
-            pair_counts[pair] = pair_counts.get(pair, 0) + 1
-
-        # Vocabulary: only pairs observed >= cat_threshold times, sorted for stable columns
-        vocab = sorted(p for p, cnt in pair_counts.items()
-                       if cnt >= cat_threshold)
-        print(
-            f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
-        pair_to_idx = {p: i for i, p in enumerate(vocab)}
-
-        cat_feat = np.zeros((len(U), len(vocab)))
-        for i, (u, v) in enumerate(zip(U, V)):
-            cu = G.nodes[u].get('poi_type', 'Unknown')
-            cv = G.nodes[v].get('poi_type', 'Unknown')
-            pair = tuple(sorted([cu, cv]))
-            idx = pair_to_idx.get(pair)
-            if idx is not None:
-                cat_feat[i, idx] = 1.0
-
-        feature_blocks.append(cat_feat)
-
-    if 'catsame' in features:
-        cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
-        cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
-
-        # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
-        cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
-        feature_blocks.append(cat_feat)
-
-    if 'cbg' in features and agg == False:
-        cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
-        cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
-        cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
-                    ).astype(float).reshape(-1, 1)
-        feature_blocks.append(cbg_feat)
-    elif 'cbg' in features and agg:
-        print('Feature "cbg" invalid for aggregated network. Skipping.')
-
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
         comm_v = np.array([G.nodes[v].get('community', -1) for v in V])
@@ -708,46 +725,32 @@ def build_feature_matrix(
                      ).astype(float).reshape(-1, 1)
         feature_blocks.append(comm_feat)
 
-    if 'ls' in features:
-        pass
-
-    if 'time' in features or 'income' in features:
+    if 'time' in features:
         # uniform distribution for fallback
         default_distr = np.array([0.25, 0.25, 0.25, 0.25])
-        if not 'time' in features:
-            # add only income
-            inc_u = np.array(
-                [G.nodes[u].get('inc_dist', default_distr) for u in U])
-            inc_v = np.array(
-                [G.nodes[v].get('inc_dist', default_distr) for v in V])
-            js_dist = jensenshannon(inc_u, inc_v, axis=1)
-            inc_feat = (js_dist ** 2).reshape(-1, 1)
-            feature_blocks.append(inc_feat)
-        elif not 'income' in features:
-            # add only time
-            time_u = np.array(
-                [G.nodes[u].get('time_dist', default_distr) for u in U])
-            time_v = np.array(
-                [G.nodes[v].get('time_dist', default_distr) for v in V])
-            js_dist = jensenshannon(time_u, time_v, axis=1)
-            time_feat = (js_dist ** 2).reshape(-1, 1)
-            feature_blocks.append(time_feat)
-        else:
-            # add both
-            inc_u = np.array(
-                [G.nodes[u].get('inc_dist', default_distr) for u in U])
-            inc_v = np.array(
-                [G.nodes[v].get('inc_dist', default_distr) for v in V])
-            js_dist = jensenshannon(inc_u, inc_v, axis=1)
-            inc_feat = (js_dist ** 2).reshape(-1, 1)
-            feature_blocks.append(inc_feat)
-            time_u = np.array(
-                [G.nodes[u].get('time_dist', default_distr) for u in U])
-            time_v = np.array(
-                [G.nodes[v].get('time_dist', default_distr) for v in V])
-            js_dist = jensenshannon(time_u, time_v, axis=1)
-            time_feat = (js_dist ** 2).reshape(-1, 1)
-            feature_blocks.append(time_feat)
+        # add only time
+        time_u = np.array(
+            [G.nodes[u].get('time_dist', default_distr) for u in U])
+        time_v = np.array(
+            [G.nodes[v].get('time_dist', default_distr) for v in V])
+        js_dist = jensenshannon(time_u, time_v, axis=1)  # ty: ignore
+        time_feat = (js_dist ** 2).reshape(-1, 1)
+        feature_blocks.append(time_feat)
+
+    if 'income' in features:
+        # uniform distribution for fallback
+        default_distr = np.array([0.25, 0.25, 0.25, 0.25])
+        # add only income
+        inc_u = np.array(
+            [G.nodes[u].get('inc_dist', default_distr) for u in U])
+        inc_v = np.array(
+            [G.nodes[v].get('inc_dist', default_distr) for v in V])
+        js_dist = jensenshannon(inc_u, inc_v, axis=1)  # ty: ignore
+        inc_feat = (js_dist ** 2).reshape(-1, 1)
+        feature_blocks.append(inc_feat)
+
+    if 'ls' in features:
+        pass
 
     X = np.hstack(feature_blocks).astype(np.float32)
 
@@ -823,7 +826,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             features = ['emb', 'geo', 'cat', 'cbg', 'comm', 'time', 'income']
     else:
         if features == 'all' or features == ['all']:
-            features = ['emb', 'geo', 'cat', 'comm']
+            features = ['emb', 'geo', 'comm', 'time', 'income']
 
     # ===== Validation =====
     needs_metadata = bool({'geo', 'cat', 'cbg', 'comm',
@@ -835,7 +838,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         )
 
     # converting training graph to nx.Graph object
-    G_train = nx.read_edgelist(trainfile, data=[('weight', float)], delimiter='\t')
+    G_train = nx.read_edgelist(
+        trainfile, data=[('weight', float)], delimiter='\t')
 
     # ===== Embedding generation (only if needed) =====
 
