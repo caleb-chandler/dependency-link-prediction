@@ -913,8 +913,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     if 'comm' in features:
         node_to_comm(G)
 
-    if 'time' in features or 'income' in features:
-        add_outside_metadata(G)
+    if not agg:
+        if 'time' in features or 'income' in features:
+            add_outside_metadata(G)
 
     X_train_pos, _ = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
