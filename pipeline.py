@@ -8,7 +8,6 @@ from sklearn.metrics import roc_auc_score
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
-from sklearn.neighbors import BallTree
 import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
@@ -172,112 +171,7 @@ def distribution_finder(G, bins=50):
     return distributions, element_sets
 
 
-def sample_non_edges_dist_controlled(G, distr, total_count):
-    def _coord(attrs, *keys):
-        for k in keys:
-            v = attrs.get(k)
-            if v is not None:
-                return float(v)
-        return 0.0
-
-    # extract coordinates and build a spatial index
-    nodes = list(G.nodes())
-    coords = np.radians([
-        [_coord(G.nodes[n], 'latitude', 'lat'),
-         _coord(G.nodes[n], 'longitude', 'lon')]
-        for n in nodes
-    ])
-
-    EARTH_RADIUS_KM = 6371.0088
-    tree = BallTree(coords, metric='haversine')
-
-    non_edges = set()
-
-    # calculate quotas for each bin based on the target distribution
-    total_edges_in_distr = distr.sum()
-    if total_edges_in_distr == 0:
-        raise ValueError("Error: Distribution is empty.")
-
-    bin_quotas = {}
-    for interval, count in distr.items():
-        proportion = count / total_edges_in_distr
-        # Round to nearest integer for the quota
-        bin_quotas[interval] = int(np.round(proportion * total_count))
-
-    # sample using targeted spatial queries
-    with tqdm(total=total_count, desc='Sampling spatial non-edges', unit='edge', leave=False) as pbar:
-        for interval, quota in bin_quotas.items():
-            if quota <= 0:
-                continue
-
-            # Now we dynamically extract exact bounds from the IntervalIndex
-            d_min_km = interval.left
-            d_max_km = interval.right
-
-            # Convert km to radians for the BallTree
-            r_min = d_min_km / EARTH_RADIUS_KM
-            r_max = d_max_km / EARTH_RADIUS_KM
-
-            samples_for_bin = 0
-            attempts = 0
-            max_attempts = quota * 50
-
-            while samples_for_bin < quota and attempts < max_attempts:
-                attempts += 1
-
-                # pick a random source node
-                u_idx = random.randint(0, len(nodes) - 1)
-                u = nodes[u_idx]
-                # converts to 2d (table with 1 row and 2 columns instead of just single row)
-                u_coord = coords[u_idx:u_idx+1]
-
-                # query the tree for nodes within the outer radius
-                indices_within_max = tree.query_radius(u_coord, r=r_max)[0]
-
-                # when d_min == 0, query_radius(r=0) returns all co-located nodes,
-                # which would incorrectly exclude valid same-location candidates
-                if d_min_km == 0:
-                    indices_within_min = np.array([u_idx])
-                else:
-                    indices_within_min = tree.query_radius(u_coord, r=r_min)[0]
-
-                # set difference gives us the nodes existing strictly in the target distance ring
-                valid_indices = np.setdiff1d(
-                    indices_within_max, indices_within_min)
-
-                if len(valid_indices) == 0:
-                    continue  # no nodes exist at this specific distance from node u
-
-                # pick a random valid destination node
-                v_idx = random.choice(valid_indices)
-                v = nodes[v_idx]
-
-                if u == v:
-                    continue
-
-                # enforce strict tuple ordering so (u,v) and (v,u) aren't duplicated
-                edge = (u, v) if u < v else (v, u)
-
-                # verify it's not a real edge and hasn't been sampled yet
-                if not G.has_edge(*edge) and edge not in non_edges:
-                    non_edges.add(edge)
-                    samples_for_bin += 1
-                    pbar.update(1)
-
-            if attempts >= max_attempts:
-                print(
-                    f"Warning: Could not fulfill spatial quota for bin [{d_min_km:.2f}, {d_max_km:.2f}]. Got {samples_for_bin}/{quota}.")
-
-    return list(non_edges)
-
-
-def sample_non_edges_fast_dist_controlled(G, distr, total_count, batch_size=2_000_000):
-    """
-    Fast distance-controlled non-edge sampler for large graphs (>1M edges).
-    Uses bulk random pair generation + vectorized haversine instead of per-bin BallTree queries.
-    Short-distance bins may be underfilled when locally dense clusters are fully connected,
-    but this also occurs in the BallTree sampler and the affected fraction is tiny.
-    """
+def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000):
     def _coord(attrs, *keys):
         for k in keys:
             v = attrs.get(k)
@@ -380,6 +274,91 @@ def sample_non_edges_fast_dist_controlled(G, distr, total_count, batch_size=2_00
     return [edge for bucket in bin_results for edge in bucket]
 
 
+def sample_non_edges_agg_stratified(G, total_count):
+    """
+    Non-edge sampler for aggregated (cat||tract) networks.
+
+    Same-tract pairs share a centroid (DIST_KM=0), so spatial sampling can't
+    fill the 0-distance bins — the within-tract graph is too dense. This sampler
+    enumerates same-tract non-edges directly, then uses distance-controlled bulk
+    sampling for cross-tract pairs, with the quota split proportional to the
+    same-tract / cross-tract ratio in the actual edge set.
+    """
+    node_tract = {}
+    for node in G.nodes():
+        parts = str(node).split('||')
+        node_tract[node] = parts[1] if len(parts) == 2 else None
+
+    same_count, cross_count = 0, 0
+    for u, v in G.edges():
+        tu, tv = node_tract.get(u), node_tract.get(v)
+        if tu is not None and tu == tv:
+            same_count += 1
+        else:
+            cross_count += 1
+
+    total_edges = same_count + cross_count
+    if total_edges == 0:
+        return []
+
+    same_quota = int(round((same_count / total_edges) * total_count))
+    cross_quota = total_count - same_quota
+
+    # same-tract: enumerate all missing category pairs per tract directly
+    tract_to_nodes = {}
+    for node in G.nodes():
+        t = node_tract.get(node)
+        if t is not None:
+            tract_to_nodes.setdefault(t, []).append(node)
+
+    pool = []
+    for nodes in tract_to_nodes.values():
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                u, v = nodes[i], nodes[j]
+                if not G.has_edge(u, v):
+                    pool.append((u, v))
+
+    if len(pool) <= same_quota:
+        same_sample = pool
+        shortfall = same_quota - len(pool)
+        if shortfall > 0:
+            print(f"Warning: only {len(pool)} same-tract non-edges available "
+                  f"(needed {same_quota}). Redistributing {shortfall} to cross-tract.")
+            cross_quota += shortfall
+    else:
+        same_sample = random.sample(pool, same_quota)
+
+    # cross-tract: build a distance distribution from cross-tract edges only,
+    # then delegate to the standard distance-controlled sampler
+    cross_non_edges = []
+    if cross_quota > 0:
+        cross_dist_vals = [
+            attrs['DIST_KM']
+            for u, v, attrs in G.edges(data=True)
+            if node_tract.get(u) != node_tract.get(v) and attrs.get('DIST_KM') is not None
+        ]
+
+        if cross_dist_vals:
+            max_d = max(cross_dist_vals)
+            bin_edges = (
+                np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
+                if max_d > 0.01 else np.linspace(0, max_d + 1e-5, 50)
+            )
+            cross_dist_distr = (
+                pd.cut(pd.Series(cross_dist_vals), bins=bin_edges, include_lowest=True)
+                .value_counts().sort_index()
+            )
+            cross_non_edges = sample_non_edges_dist_controlled(G, cross_dist_distr, cross_quota)
+            # drop any same-tract pairs (distance=0) that landed in the first bin
+            cross_non_edges = [
+                (u, v) for u, v in cross_non_edges
+                if node_tract.get(u) != node_tract.get(v)
+            ]
+
+    return same_sample + cross_non_edges
+
+
 # ====================================================================
 # PREPARE_DATA
 # ====================================================================
@@ -450,14 +429,14 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
                     f'Value "{weight}" not recognized when agg=True. Falling back to unweighted.')
                 G_train.add_edges_from(train_edges)
 
-        # sample non-edges by bin to preserve distribution
-        distrs, _ = distribution_finder(G)
-        dist_bins = distrs[0]  # distance dict
-
-        # getting true negatives (overlap possible but very improbable for large datasets)
-        sampler = sample_non_edges_fast_dist_controlled if agg else sample_non_edges_dist_controlled
-        test_non_edges = sampler(G, dist_bins, len(test_edges))
-        train_non_edges = sampler(G, dist_bins, len(train_edges))
+        if agg:
+            test_non_edges = sample_non_edges_agg_stratified(G, len(test_edges))
+            train_non_edges = sample_non_edges_agg_stratified(G, len(train_edges))
+        else:
+            distrs, _ = distribution_finder(G)
+            dist_bins = distrs[0]
+            test_non_edges = sample_non_edges_dist_controlled(G, dist_bins, len(test_edges))
+            train_non_edges = sample_non_edges_dist_controlled(G, dist_bins, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
