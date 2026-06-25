@@ -33,6 +33,8 @@ def load(fpath, compress=False):
         'DEP': 'float32',
     }
     df = pd.read_csv(fpath, sep='\s+', names=_cols, dtype=_dtypes)
+    df = df.dropna(subset=['ORIGIN', 'DESTINATION',
+                   'TAXONOMY_ORIGIN', 'TAXONOMY_DESTINATION'])
 
     # optional log-compression
     if compress:
@@ -51,14 +53,14 @@ def load(fpath, compress=False):
 
     # assign node attrs
     origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
-                  'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].dropna().drop_duplicates()
+                  'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
     # FIX: Align columns directly to match expected attributes ('latitude', 'longitude', 'poi_type')
     origins.columns = ['node_id', 'latitude', 'longitude',
                        'poi_type', 'unique_visits', 'total_visits']
 
     destinations = df[['DESTINATION', 'LAT_DESTINATION',
                        'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
-                       'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].dropna().drop_duplicates()
+                       'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
     # FIX: Align columns directly to match expected attributes
     destinations.columns = ['node_id', 'latitude', 'longitude',
                             'poi_type', 'unique_visits', 'total_visits']
@@ -346,10 +348,12 @@ def sample_non_edges_agg_stratified(G, total_count):
                 if max_d > 0.01 else np.linspace(0, max_d + 1e-5, 50)
             )
             cross_dist_distr = (
-                pd.cut(pd.Series(cross_dist_vals), bins=bin_edges, include_lowest=True)
+                pd.cut(pd.Series(cross_dist_vals),
+                       bins=bin_edges, include_lowest=True)
                 .value_counts().sort_index()
             )
-            cross_non_edges = sample_non_edges_dist_controlled(G, cross_dist_distr, cross_quota)
+            cross_non_edges = sample_non_edges_dist_controlled(
+                G, cross_dist_distr, cross_quota)
             # drop any same-tract pairs (distance=0) that landed in the first bin
             cross_non_edges = [
                 (u, v) for u, v in cross_non_edges
@@ -430,13 +434,17 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
                 G_train.add_edges_from(train_edges)
 
         if agg:
-            test_non_edges = sample_non_edges_agg_stratified(G, len(test_edges))
-            train_non_edges = sample_non_edges_agg_stratified(G, len(train_edges))
+            test_non_edges = sample_non_edges_agg_stratified(
+                G, len(test_edges))
+            train_non_edges = sample_non_edges_agg_stratified(
+                G, len(train_edges))
         else:
             distrs, _ = distribution_finder(G)
             dist_bins = distrs[0]
-            test_non_edges = sample_non_edges_dist_controlled(G, dist_bins, len(test_edges))
-            train_non_edges = sample_non_edges_dist_controlled(G, dist_bins, len(train_edges))
+            test_non_edges = sample_non_edges_dist_controlled(
+                G, dist_bins, len(test_edges))
+            train_non_edges = sample_non_edges_dist_controlled(
+                G, dist_bins, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
