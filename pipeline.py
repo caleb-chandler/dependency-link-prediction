@@ -368,7 +368,9 @@ def sample_non_edges_agg_stratified(G, total_count):
 # ====================================================================
 
 
-def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None, trainfile='train.txt'):
+def prepare_data(
+    fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None, trainfile='train.txt', controlled=True
+):
     """
     Prepare data for link prediction pipeline.
 
@@ -433,18 +435,34 @@ def prepare_data(fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None,
                     f'Value "{weight}" not recognized when agg=True. Falling back to unweighted.')
                 G_train.add_edges_from(train_edges)
 
-        if agg:
-            test_non_edges = sample_non_edges_agg_stratified(
-                G, len(test_edges))
-            train_non_edges = sample_non_edges_agg_stratified(
-                G, len(train_edges))
+        if controlled:
+            if agg:
+                test_non_edges = sample_non_edges_agg_stratified(
+                    G, len(test_edges))
+                train_non_edges = sample_non_edges_agg_stratified(
+                    G, len(train_edges))
+            else:
+                distrs, _ = distribution_finder(G)
+                dist_bins = distrs[0]
+                test_non_edges = sample_non_edges_dist_controlled(
+                    G, dist_bins, len(test_edges))
+                train_non_edges = sample_non_edges_dist_controlled(
+                    G, dist_bins, len(train_edges))
         else:
-            distrs, _ = distribution_finder(G)
-            dist_bins = distrs[0]
-            test_non_edges = sample_non_edges_dist_controlled(
-                G, dist_bins, len(test_edges))
-            train_non_edges = sample_non_edges_dist_controlled(
-                G, dist_bins, len(train_edges))
+            # function to sample non-edges randomly
+            def sample_non_edges(G, count):
+                non_edges = set()
+                nodes = list(G.nodes())
+                with tqdm(total=count, desc='sampling non-edges', unit='edge', leave=False) as pbar:
+                    while len(non_edges) < count:
+                        u, v = sorted(random.sample(nodes, 2))
+                        if not G.has_edge(u, v) and (u, v) not in non_edges:
+                            non_edges.add((u, v))
+                            pbar.update(1)
+                return list(non_edges)
+
+            test_non_edges = sample_non_edges(G, len(test_edges))
+            train_non_edges = sample_non_edges(G, len(train_edges))
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
