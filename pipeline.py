@@ -429,6 +429,9 @@ def prepare_data(
             if weight == 'num_occ':
                 G_train.add_weighted_edges_from(
                     [(u, v, G[u][v]['weight']) for u, v in train_edges])
+            elif weight == 'cov':
+                G_train.add_weighted_edges_from(
+                    [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
             else:
                 # fallback for invalid weights when agg is True
                 print(
