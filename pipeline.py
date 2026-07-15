@@ -432,6 +432,9 @@ def prepare_data(
             elif weight == 'cov':
                 G_train.add_weighted_edges_from(
                     [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
+            elif weight == 'dep':
+                G_train.add_weighted_edges_from(
+                    [(u, v, G[u][v]['DEP']) for u, v in train_edges])
             else:
                 # fallback for invalid weights when agg is True
                 print(
@@ -690,7 +693,7 @@ def build_feature_matrix(
             cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
                         ).astype(float).reshape(-1, 1)
             feature_blocks.append(cbg_feat)
-    else:
+    elif not agg:
         print(
             'Category and census-based features invalid for aggregated network. Skipping.')
 
