@@ -14,6 +14,63 @@ from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
 
 # ===================================================================
+# EMBEDDING STORE
+# ===================================================================
+
+
+class EmbeddingMap:
+    """Memory-efficient node embedding store.
+
+    Keeps embeddings as a single contiguous float32 matrix plus a
+    ``node_id -> row_index`` dict, instead of a dict of Python lists. This is
+    ~8x smaller in RAM (float32 packed vs. boxed Python floats + list
+    pointers) and lets feature construction fancy-index rows without a
+    float64 detour. Storing float32 is lossless: pecanpy/gensim emit float32
+    and the feature matrix is cast to float32 downstream anyway.
+
+    Exposes a dict-like interface (``in``, ``[]``, ``len``, ``keys``) so
+    existing call sites — including the precomputed path and the returned
+    value — keep working unchanged. Plain dicts saved by older runs still
+    work everywhere too (build_feature_matrix falls back to per-key lookup).
+    """
+
+    __slots__ = ('matrix', 'idx_of')
+
+    def __init__(self, matrix, idx_of):
+        self.matrix = np.ascontiguousarray(matrix, dtype=np.float32)
+        self.idx_of = idx_of
+
+    @classmethod
+    def from_pecanpy(cls, nodes, embeddings):
+        """Build from pecanpy's node list and embedding matrix (skips None)."""
+        idx_of = {}
+        keep_rows = []
+        for i, node_id in enumerate(nodes):
+            if node_id is None:
+                continue
+            idx_of[str(node_id)] = len(keep_rows)
+            keep_rows.append(i)
+        matrix = np.asarray(embeddings, dtype=np.float32)[keep_rows]
+        return cls(matrix, idx_of)
+
+    def __contains__(self, key):
+        return key in self.idx_of
+
+    def __getitem__(self, key):
+        return self.matrix[self.idx_of[key]]
+
+    def __len__(self):
+        return len(self.idx_of)
+
+    def keys(self):
+        return self.idx_of.keys()
+
+    def rows(self, keys):
+        """Return a (len(keys), dim) float32 array for the given node ids."""
+        return self.matrix[[self.idx_of[k] for k in keys]]
+
+
+# ===================================================================
 # GRAPH LOADING FUNCTION
 # ===================================================================
 
@@ -643,9 +700,14 @@ def build_feature_matrix(
 
     # Vectorized Embedding Operations
     if 'emb' in features:
-        # Extract to 2D arrays: shape (N, 128)
-        emb_u = np.array([embedding_map[u] for u in U])
-        emb_v = np.array([embedding_map[v] for v in V])
+        # Extract to 2D arrays: shape (N, dim). Fancy-index the packed matrix
+        # when available; fall back to per-key lookup for plain-dict maps.
+        if hasattr(embedding_map, 'rows'):
+            emb_u = embedding_map.rows(U)
+            emb_v = embedding_map.rows(V)
+        else:
+            emb_u = np.asarray([embedding_map[u] for u in U], dtype=np.float32)
+            emb_v = np.asarray([embedding_map[v] for v in V], dtype=np.float32)
 
         # Binary operator applies to the entire (N, 128) array simultaneously
         emb_feat = op_fn(emb_u, emb_v)
@@ -905,13 +967,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 f"Pecanpy walk generation failed for all modes: {tried_modes}"
             ) from last_exception
 
-        embedding_map = {}
-        for i, node_id in enumerate(g.nodes):
-            if node_id is None:
-                continue
-            # Force node_id to string to maintain consistency with graph node IDs
-            key = str(node_id)
-            embedding_map[key] = embeddings[i].tolist()
+        # Store as a packed float32 matrix + index (str keys stay consistent
+        # with graph node IDs) instead of a dict of Python lists — ~8x less RAM.
+        embedding_map = EmbeddingMap.from_pecanpy(g.nodes, embeddings)
 
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
 
