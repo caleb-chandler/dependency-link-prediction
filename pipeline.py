@@ -580,7 +580,7 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
+def node_to_area(G, shapefile_path='data/dist/tl_2025_25_bg.shp'):
     """Add 'cbg' + 'tract' attribute to each node in G via spatial join."""
     nodes = list(G.nodes())
     lats = [G.nodes[n].get('latitude', 0) for n in nodes]
@@ -651,7 +651,7 @@ def build_feature_matrix(
     by `features`, which is a list that can contain any combination of:
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
-        'geo'       – log geographic distance in km  (1-d)
+        'dist'       – log geographic distance in km  (1-d)
         'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
         'catsame'   - simplified same/different category feature for baseline comparison
         'cbg'       - binary for same/different census-block group
@@ -760,7 +760,7 @@ def build_feature_matrix(
             'Category and census-based features invalid for aggregated network. Skipping.')
 
     # vectorized geographic distance
-    if 'geo' in features:
+    if 'dist' in features:
         # Fast extraction using list comprehensions (dict lookups are fast, math is slow)
         lat_u = np.array([G.nodes[u].get('latitude')
                          or 0.0 for u in U], dtype=np.float64)
@@ -847,9 +847,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     train_non_edges : list
         Negative training edges.
     test_edges : list
-        Positive testing edges.
+        Positive test edges.
     test_non_edges : list
-        Negative testing edges.
+        Negative test edges.
     G : nx.Graph
         The *original* graph with node attributes (latitude, longitude,
         poi_type, total_visits). Required when features includes anything
@@ -862,6 +862,12 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         Binary operator for embeddings. Default 'hadamard'.
     **kwargs
         Hyperparameter settings forwarded to PecanPy / Word2Vec. Also allows for seed.
+        strength : float in (0, 1), optional
+            If set, additionally trains a second "strength" classifier over
+            positive edges only: strong (DEP above the given quantile) vs weak.
+            0.5 gives a median split. The threshold is fit on train positives.
+            Reuses the same features/embeddings as the link task. Default None
+            (off), leaving the pipeline's behavior and return signature unchanged.
 
     Returns
     -------
@@ -869,6 +875,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         AUC score for the specified feature/operator combination.
     embedding_map : dict or None
         Node embeddings (only populated when 'emb' in features).
+    strength_auc : float
+        Only returned when `strength` is set — AUC of the strong-vs-weak
+        classifier on the positive test edges.
     """
     # === unpacking kwargs ===
     # hyperparameters
@@ -887,6 +896,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # switch for weighted/directed version
     weighted = kwargs.get('weighted', False)
     directed = kwargs.get('directed', False)
+    strength = kwargs.get('strength', None)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -896,13 +906,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     if not agg:
         if features == 'all' or features == ['all']:
-            features = ['emb', 'geo', 'cat', 'cbg', 'comm', 'time', 'income']
+            features = ['emb', 'dist', 'cat', 'cbg', 'comm', 'time', 'income']
     else:
         if features == 'all' or features == ['all']:
-            features = ['emb', 'geo', 'comm', 'time', 'income']
+            features = ['emb', 'dist', 'comm', 'time', 'income']
 
     # ===== Validation =====
-    needs_metadata = bool({'geo', 'cat', 'cbg', 'comm',
+    needs_metadata = bool({'dist', 'cat', 'cbg', 'comm',
                           'time', 'income'} & set(features))
     if needs_metadata and G is None:
         raise ValueError(
@@ -986,7 +996,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if 'time' in features or 'income' in features:
             add_outside_metadata(G)
 
-    X_train_pos, _ = build_feature_matrix(
+    X_train_pos, keep_train_pos = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
     X_train_neg, _ = build_feature_matrix(
         train_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
@@ -996,7 +1006,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.ones(len(X_train_pos)),
         np.zeros(len(X_train_neg))
     ])
-    del X_train_pos, X_train_neg
+    if not strength:
+        del X_train_pos, X_train_neg
+    else:
+        del X_train_neg
 
     # shuffle
     shuffle_idx = np.random.permutation(len(y_train))
@@ -1011,7 +1024,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     model.fit(X_train, y_train)
 
     # ===== Test =====
-    X_test_pos, _ = build_feature_matrix(
+    X_test_pos, keep_test_pos = build_feature_matrix(
         test_edges, G, features, embedding_map, operator, cat_threshold, agg)
     X_test_neg, _ = build_feature_matrix(
         test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
@@ -1029,5 +1042,36 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     feature_label = '+'.join(features)
     op_label = f" ({operator})" if 'emb' in features else ""
     print(f"[{feature_label}{op_label}]  AUC = {auc:.4f}")
+
+    # ===== Strength head (optional add-on) =====
+    # A second, conditional classifier over positive edges only: given a real
+    # link, is its DEP above the `strength` quantile (strong) or below (weak)?
+    # Reuses the same features/embeddings as the link task — only the label
+    # differs. The quantile threshold is fit on train positives to avoid leaking
+    # the test distribution. Left off (strength=None) the pipeline is unchanged.
+    if strength:
+        def _dep(edges, keep):
+            return np.array([G[u][v]['DEP'] for u, v in edges],
+                            dtype=np.float64)[keep]
+
+        dep_train = _dep(train_pos_edges, keep_train_pos)
+        dep_test = _dep(test_edges, keep_test_pos)
+
+        thr = np.quantile(dep_train, strength)
+        y_str_train = (dep_train > thr).astype(int)
+        y_str_test = (dep_test > thr).astype(int)
+
+        str_model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=1000, class_weight='balanced'))
+        str_model.fit(X_train_pos, y_str_train)
+        str_probs = str_model.predict_proba(X_test_pos)[:, 1]
+        strength_auc = roc_auc_score(y_str_test, str_probs)
+
+        print(f"[{feature_label}{op_label}]  strength AUC "
+              f"(DEP > q{strength:g}={thr:.4g}) = {strength_auc:.4f}  "
+              f"(train strong frac = {y_str_train.mean():.3f})")
+
+        return auc, embedding_map, strength_auc
 
     return auc, embedding_map
