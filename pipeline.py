@@ -651,7 +651,7 @@ def build_feature_matrix(
     by `features`, which is a list that can contain any combination of:
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
-        'dist'       – log geographic distance in km  (1-d)
+        'dist'      - log geographic distance in km  (1-d)
         'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
         'catsame'   - simplified same/different category feature for baseline comparison
         'cbg'       - binary for same/different census-block group
@@ -806,7 +806,7 @@ def build_feature_matrix(
             [G.nodes[u].get('time_dist', default_distr) for u in U])
         time_v = np.array(
             [G.nodes[v].get('time_dist', default_distr) for v in V])
-        js_dist = jensenshannon(time_u, time_v, axis=1)  # ty: ignore
+        js_dist = jensenshannon(time_u, time_v, axis=1)
         time_feat = (js_dist ** 2).reshape(-1, 1)
         feature_blocks.append(time_feat)
 
@@ -818,7 +818,7 @@ def build_feature_matrix(
             [G.nodes[u].get('inc_dist', default_distr) for u in U])
         inc_v = np.array(
             [G.nodes[v].get('inc_dist', default_distr) for v in V])
-        js_dist = jensenshannon(inc_u, inc_v, axis=1)  # ty: ignore
+        js_dist = jensenshannon(inc_u, inc_v, axis=1)
         inc_feat = (js_dist ** 2).reshape(-1, 1)
         feature_blocks.append(inc_feat)
 
@@ -1011,16 +1011,24 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     else:
         del X_train_neg
 
-    # shuffle
-    shuffle_idx = np.random.permutation(len(y_train))
-    X_train = X_train[shuffle_idx]
-    y_train = y_train[shuffle_idx]
+    # No shuffle: lbfgs is a batch solver and order-invariant, so the row
+    # permutation only cost a full extra copy of the matrix at peak RAM.
 
     print(
         f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
 
     # ===== Train =====
-    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+    # Standardize in float32, in place. StandardScaler upcasts to float64
+    # (2x RAM on a multi-GB matrix); lbfgs LogisticRegression keeps float32,
+    # so hand-rolling the z-score avoids the float64 blowup entirely. Stats are
+    # accumulated in float64 for numerical stability, then cast back.
+    train_mean = X_train.mean(axis=0, dtype=np.float64).astype(np.float32)
+    train_std = X_train.std(axis=0, dtype=np.float64).astype(np.float32)
+    train_std[train_std == 0] = 1.0
+    X_train -= train_mean
+    X_train /= train_std
+
+    model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
 
     # ===== Test =====
@@ -1034,6 +1042,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.ones(len(X_test_pos)),
         np.zeros(len(X_test_neg))
     ])
+
+    # Apply the training z-score to the test matrix in place (same reason as above)
+    X_test -= train_mean
+    X_test /= train_std
 
     probs = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, probs)
@@ -1061,16 +1073,23 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         y_str_train = (dep_train > thr).astype(int)
         y_str_test = (dep_test > thr).astype(int)
 
-        str_model = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(max_iter=1000, class_weight='balanced'))
+        # Same float32 in-place standardization as the link head (avoids the
+        # StandardScaler float64 upcast on the positive-edge matrix).
+        str_mean = X_train_pos.mean(
+            axis=0, dtype=np.float64).astype(np.float32)
+        str_std = X_train_pos.std(axis=0, dtype=np.float64).astype(np.float32)
+        str_std[str_std == 0] = 1.0
+        X_train_pos -= str_mean
+        X_train_pos /= str_std
+        X_test_pos -= str_mean
+        X_test_pos /= str_std
+
+        str_model = LogisticRegression(max_iter=1000, class_weight='balanced')
         str_model.fit(X_train_pos, y_str_train)
         str_probs = str_model.predict_proba(X_test_pos)[:, 1]
         strength_auc = roc_auc_score(y_str_test, str_probs)
 
-        print(f"[{feature_label}{op_label}]  strength AUC "
-              f"(DEP > q{strength:g}={thr:.4g}) = {strength_auc:.4f}  "
-              f"(train strong frac = {y_str_train.mean():.3f})")
+        print(f"[{feature_label}{op_label}]  strength AUC = {strength_auc:.4f}")
 
         return auc, embedding_map, strength_auc
 

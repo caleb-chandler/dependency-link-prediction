@@ -6,7 +6,10 @@
       "Bash(python -c ' *)",
       "Read(//c/Users/User/anaconda3/envs/depnet/**)",
       "Read(//c/Users/User/.claude/projects/c--Users-User-Documents-research-dependency-link-prediction/0602c733-7e81-4c95-bbce-f63e9ae67d94/tool-results/**)",
-      "Bash(python -c \"import json; nb=json.load\\(open\\('agg-network.ipynb'\\)\\); print\\(len\\(nb['cells']\\)\\)\")"
+      "Bash(python -c \"import json; nb=json.load\\(open\\('agg-network.ipynb'\\)\\); print\\(len\\(nb['cells']\\)\\)\")",
+      "Bash(ls data/agg/undir_dep/tests/seed21/*strength*feats_emb.txt)",
+      "Bash(ls data/agg/undir_dep/tests/seed21/weight_None/)",
+      "Bash(ls data/agg/undir_dep/tests/seed21/weight_dep/*emb*)"
     ]
   }
 }
