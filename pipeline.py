@@ -868,6 +868,12 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             0.5 gives a median split. The threshold is fit on train positives.
             Reuses the same features/embeddings as the link task. Default None
             (off), leaving the pipeline's behavior and return signature unchanged.
+        strength_dist_control : bool, optional
+            Only meaningful with `strength`. Distance-matches the strong/weak
+            classes by binning positive edges by geographic distance and keeping
+            min(#strong, #weak) per bin, so distance carries no marginal signal
+            about strength. Default False. If a class empties out after matching,
+            strength_auc is nan.
 
     Returns
     -------
@@ -897,6 +903,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     weighted = kwargs.get('weighted', False)
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
+    strength_dist_control = kwargs.get('strength_dist_control', True)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1066,12 +1073,69 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             return np.array([G[u][v]['DEP'] for u, v in edges],
                             dtype=np.float64)[keep]
 
+        def _edge_dist(edges, keep):
+            # Haversine km for the kept positive edges, aligned to `keep`
+            # (same formula as the 'dist' feature block above).
+            kept = [edges[i] for i in keep]
+            la_u = np.radians(np.array(
+                [G.nodes[u].get('latitude') or 0.0 for u, _ in kept], dtype=np.float64))
+            lo_u = np.radians(np.array(
+                [G.nodes[u].get('longitude') or 0.0 for u, _ in kept], dtype=np.float64))
+            la_v = np.radians(np.array(
+                [G.nodes[v].get('latitude') or 0.0 for _, v in kept], dtype=np.float64))
+            lo_v = np.radians(np.array(
+                [G.nodes[v].get('longitude') or 0.0 for _, v in kept], dtype=np.float64))
+            a = np.sin((la_v - la_u) / 2) ** 2 + np.cos(la_u) * \
+                np.cos(la_v) * np.sin((lo_v - lo_u) / 2) ** 2
+            a = np.clip(a, 0.0, 1.0)
+            return 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+        def _dist_matched_idx(dep, dist, thr):
+            # Bin positives by distance (same log bins as the non-edge sampler),
+            # then keep min(#strong, #weak) from each bin so the two classes
+            # share a distance distribution and distance can't predict strength.
+            strong = dep > thr
+            if dist.max() > 0.01:
+                edges_b = np.concatenate(
+                    ([0], np.geomspace(0.01, dist.max(), 50)))
+            else:
+                edges_b = np.linspace(0, dist.max() + 1e-5, 50)
+            b = np.digitize(dist, edges_b)
+            keep = []
+            for bin_id in np.unique(b):
+                in_bin = np.where(b == bin_id)[0]
+                s = in_bin[strong[in_bin]]
+                w = in_bin[~strong[in_bin]]
+                k = min(len(s), len(w))
+                if k == 0:
+                    continue
+                keep.extend(np.random.choice(s, k, replace=False))
+                keep.extend(np.random.choice(w, k, replace=False))
+            return np.sort(np.array(keep, dtype=int))
+
         dep_train = _dep(train_pos_edges, keep_train_pos)
         dep_test = _dep(test_edges, keep_test_pos)
 
         thr = np.quantile(dep_train, strength)
         y_str_train = (dep_train > thr).astype(int)
         y_str_test = (dep_test > thr).astype(int)
+
+        if strength_dist_control:
+            idx_tr = _dist_matched_idx(
+                dep_train, _edge_dist(train_pos_edges, keep_train_pos), thr)
+            idx_te = _dist_matched_idx(
+                dep_test, _edge_dist(test_edges, keep_test_pos), thr)
+            X_train_pos = X_train_pos[idx_tr]
+            X_test_pos = X_test_pos[idx_te]
+            y_str_train = y_str_train[idx_tr]
+            y_str_test = y_str_test[idx_te]
+            print(f"Distance-matched strength set: "
+                  f"train {len(idx_tr)}/{len(dep_train)}, "
+                  f"test {len(idx_te)}/{len(dep_test)} edges kept")
+            if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
+                print("Warning: a strength class vanished after distance "
+                      "matching — cannot score. Returning nan.")
+                return auc, embedding_map, float('nan')
 
         # Same float32 in-place standardization as the link head (avoids the
         # StandardScaler float64 upcast on the positive-edge matrix).
@@ -1089,7 +1153,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         str_probs = str_model.predict_proba(X_test_pos)[:, 1]
         strength_auc = roc_auc_score(y_str_test, str_probs)
 
-        print(f"[{feature_label}{op_label}]  strength AUC = {strength_auc:.4f}")
+        print(f"[{feature_label}{op_label}]"
+              f"  strength AUC = {strength_auc:.4f}")
 
         return auc, embedding_map, strength_auc
 
