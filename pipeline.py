@@ -641,6 +641,24 @@ def add_outside_metadata(G):
                                                           ['1', '2', '3', '4']].values
 
 
+def edge_distances_km(G, edges):
+    """Haversine distance (km) between endpoints of each (u, v) edge in `edges`."""
+    if not edges:
+        return np.array([], dtype=np.float64)
+    lat_u = np.radians(np.array(
+        [G.nodes[u].get('latitude') or 0.0 for u, _ in edges], dtype=np.float64))
+    lng_u = np.radians(np.array(
+        [G.nodes[u].get('longitude') or 0.0 for u, _ in edges], dtype=np.float64))
+    lat_v = np.radians(np.array(
+        [G.nodes[v].get('latitude') or 0.0 for _, v in edges], dtype=np.float64))
+    lng_v = np.radians(np.array(
+        [G.nodes[v].get('longitude') or 0.0 for _, v in edges], dtype=np.float64))
+    a = np.sin((lat_v - lat_u) / 2) ** 2 + np.cos(lat_u) * \
+        np.cos(lat_v) * np.sin((lng_v - lng_u) / 2) ** 2
+    a = np.clip(a, 0.0, 1.0)
+    return 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
 def build_feature_matrix(
         edges, G, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
 ):
@@ -674,6 +692,7 @@ def build_feature_matrix(
     X : np.ndarray of shape (n_edges, n_features)
     kept_indices : list of int – indices into `edges` that were actually kept
         (some may be dropped if embeddings are missing)
+    feature_names : list of str – one name per column of X, in column order
     """
     op_fn = BINARY_OPERATORS[operator]
 
@@ -691,12 +710,13 @@ def build_feature_matrix(
         kept_indices = list(range(len(edges)))
 
     if not valid_edges:
-        return np.empty((0, 0)), []
+        return np.empty((0, 0)), [], []
 
     # Unzip the list of tuples into two parallel lists of origins (U) and destinations (V)
     U, V = zip(*valid_edges)
 
     feature_blocks = []
+    feature_names = []
 
     # Vectorized Embedding Operations
     if 'emb' in features:
@@ -712,6 +732,7 @@ def build_feature_matrix(
         # Binary operator applies to the entire (N, 128) array simultaneously
         emb_feat = op_fn(emb_u, emb_v)
         feature_blocks.append(emb_feat)
+        feature_names.extend(f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
     if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
         if 'cat' in features:
@@ -740,6 +761,7 @@ def build_feature_matrix(
                     cat_feat[i, idx] = 1.0
 
             feature_blocks.append(cat_feat)
+            feature_names.extend(f'cat_{a}||{b}' for a, b in vocab)
 
         if 'catsame' in features:
             cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
@@ -748,6 +770,7 @@ def build_feature_matrix(
             # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
             cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
             feature_blocks.append(cat_feat)
+            feature_names.append('catsame')
 
         if 'cbg' in features:
             cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
@@ -755,6 +778,7 @@ def build_feature_matrix(
             cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
                         ).astype(float).reshape(-1, 1)
             feature_blocks.append(cbg_feat)
+            feature_names.append('cbg_same')
     elif not agg:
         print(
             'Category and census-based features invalid for aggregated network. Skipping.')
@@ -790,6 +814,7 @@ def build_feature_matrix(
         # Log scale and reshape to (N, 1) column vector
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
+        feature_names.append('log_dist_km')
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
@@ -797,6 +822,7 @@ def build_feature_matrix(
         comm_feat = ((comm_u == comm_v) & (comm_u != -1)
                      ).astype(float).reshape(-1, 1)
         feature_blocks.append(comm_feat)
+        feature_names.append('comm_same')
 
     if 'time' in features:
         # uniform distribution for fallback
@@ -809,6 +835,7 @@ def build_feature_matrix(
         js_dist = jensenshannon(time_u, time_v, axis=1)
         time_feat = (js_dist ** 2).reshape(-1, 1)
         feature_blocks.append(time_feat)
+        feature_names.append('time_js_div')
 
     if 'income' in features:
         # uniform distribution for fallback
@@ -821,13 +848,14 @@ def build_feature_matrix(
         js_dist = jensenshannon(inc_u, inc_v, axis=1)
         inc_feat = (js_dist ** 2).reshape(-1, 1)
         feature_blocks.append(inc_feat)
+        feature_names.append('income_js_div')
 
     if 'ls' in features:
         pass
 
     X = np.hstack(feature_blocks).astype(np.float32)
 
-    return X, kept_indices
+    return X, kept_indices, feature_names
 
 
 # ===================================================================
@@ -874,6 +902,14 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             min(#strong, #weak) per bin, so distance carries no marginal signal
             about strength. Default False. If a class empties out after matching,
             strength_auc is nan.
+        diagnostics : bool, optional
+            If True, additionally returns a dict for building a regression
+            table + error analysis: fitted model(s), feature names, test
+            labels/predicted probabilities, and per-test-edge geographic
+            distance (km). Default False, leaving the return signature
+            otherwise unchanged. Keys: 'feature_names', 'link' (always), and
+            'strength' (only when `strength` is set) — each of the latter two
+            maps to {'model', 'y_test', 'probs', 'dist_km'}.
 
     Returns
     -------
@@ -884,6 +920,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     strength_auc : float
         Only returned when `strength` is set — AUC of the strong-vs-weak
         classifier on the positive test edges.
+    diagnostics : dict
+        Only returned when `diagnostics=True` (always the last return value).
     """
     # === unpacking kwargs ===
     # hyperparameters
@@ -904,6 +942,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
+    diagnostics = kwargs.get('diagnostics', False)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1003,9 +1042,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if 'time' in features or 'income' in features:
             add_outside_metadata(G)
 
-    X_train_pos, keep_train_pos = build_feature_matrix(
+    X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
-    X_train_neg, _ = build_feature_matrix(
+    X_train_neg, _, _ = build_feature_matrix(
         train_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_train = np.vstack([X_train_pos, X_train_neg])
@@ -1039,9 +1078,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     model.fit(X_train, y_train)
 
     # ===== Test =====
-    X_test_pos, keep_test_pos = build_feature_matrix(
+    X_test_pos, keep_test_pos, _ = build_feature_matrix(
         test_edges, G, features, embedding_map, operator, cat_threshold, agg)
-    X_test_neg, _ = build_feature_matrix(
+    X_test_neg, keep_test_neg, _ = build_feature_matrix(
         test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
@@ -1056,6 +1095,27 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     probs = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, probs)
+
+    diag = None
+    if diagnostics:
+        test_pos_kept_edges = [test_edges[i] for i in keep_test_pos]
+        test_neg_kept_edges = [test_non_edges[i] for i in keep_test_neg]
+        if G is not None:
+            test_dist_km = np.concatenate([
+                edge_distances_km(G, test_pos_kept_edges),
+                edge_distances_km(G, test_neg_kept_edges),
+            ])
+        else:
+            test_dist_km = np.full(len(y_test), np.nan)
+        diag = {
+            'feature_names': feature_names,
+            'link': {
+                'model': model,
+                'y_test': y_test,
+                'probs': probs,
+                'dist_km': test_dist_km,
+            },
+        }
 
     # ===== Report =====
     feature_label = '+'.join(features)
@@ -1072,23 +1132,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         def _dep(edges, keep):
             return np.array([G[u][v]['DEP'] for u, v in edges],
                             dtype=np.float64)[keep]
-
-        def _edge_dist(edges, keep):
-            # Haversine km for the kept positive edges, aligned to `keep`
-            # (same formula as the 'dist' feature block above).
-            kept = [edges[i] for i in keep]
-            la_u = np.radians(np.array(
-                [G.nodes[u].get('latitude') or 0.0 for u, _ in kept], dtype=np.float64))
-            lo_u = np.radians(np.array(
-                [G.nodes[u].get('longitude') or 0.0 for u, _ in kept], dtype=np.float64))
-            la_v = np.radians(np.array(
-                [G.nodes[v].get('latitude') or 0.0 for _, v in kept], dtype=np.float64))
-            lo_v = np.radians(np.array(
-                [G.nodes[v].get('longitude') or 0.0 for _, v in kept], dtype=np.float64))
-            a = np.sin((la_v - la_u) / 2) ** 2 + np.cos(la_u) * \
-                np.cos(la_v) * np.sin((lo_v - lo_u) / 2) ** 2
-            a = np.clip(a, 0.0, 1.0)
-            return 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
         def _dist_matched_idx(dep, dist, thr):
             # Bin positives by distance (same log bins as the non-edge sampler),
@@ -1122,9 +1165,11 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
         if strength_dist_control:
             idx_tr = _dist_matched_idx(
-                dep_train, _edge_dist(train_pos_edges, keep_train_pos), thr)
+                dep_train, edge_distances_km(
+                    G, [train_pos_edges[i] for i in keep_train_pos]), thr)
             idx_te = _dist_matched_idx(
-                dep_test, _edge_dist(test_edges, keep_test_pos), thr)
+                dep_test, edge_distances_km(
+                    G, [test_edges[i] for i in keep_test_pos]), thr)
             X_train_pos = X_train_pos[idx_tr]
             X_test_pos = X_test_pos[idx_te]
             y_str_train = y_str_train[idx_tr]
@@ -1135,7 +1180,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
                 print("Warning: a strength class vanished after distance "
                       "matching — cannot score. Returning nan.")
-                return auc, embedding_map, float('nan')
+                return (auc, embedding_map, float('nan'), diag) if diagnostics \
+                    else (auc, embedding_map, float('nan'))
 
         # Same float32 in-place standardization as the link head (avoids the
         # StandardScaler float64 upcast on the positive-edge matrix).
@@ -1156,6 +1202,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"[{feature_label}{op_label}]"
               f"  strength AUC = {strength_auc:.4f}")
 
+        if diagnostics:
+            if strength_dist_control:
+                str_test_edges = [test_edges[keep_test_pos[i]] for i in idx_te]
+            else:
+                str_test_edges = [test_edges[i] for i in keep_test_pos]
+            diag['strength'] = {
+                'model': str_model,
+                'y_test': y_str_test,
+                'probs': str_probs,
+                'dist_km': edge_distances_km(G, str_test_edges) if G is not None
+                else np.full(len(y_str_test), np.nan),
+            }
+            return auc, embedding_map, strength_auc, diag
+
         return auc, embedding_map, strength_auc
 
-    return auc, embedding_map
+    return (auc, embedding_map, diag) if diagnostics else (auc, embedding_map)

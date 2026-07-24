@@ -9,7 +9,9 @@
       "Bash(python -c \"import json; nb=json.load\\(open\\('agg-network.ipynb'\\)\\); print\\(len\\(nb['cells']\\)\\)\")",
       "Bash(ls data/agg/undir_dep/tests/seed21/*strength*feats_emb.txt)",
       "Bash(ls data/agg/undir_dep/tests/seed21/weight_None/)",
-      "Bash(ls data/agg/undir_dep/tests/seed21/weight_dep/*emb*)"
+      "Bash(ls data/agg/undir_dep/tests/seed21/weight_dep/*emb*)",
+      "Bash(jupyter nbconvert *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('pipeline.py', encoding='utf-8'\\).read\\(\\)\\)\")"
     ]
   }
 }
