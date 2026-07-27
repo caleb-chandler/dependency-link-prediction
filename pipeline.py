@@ -909,7 +909,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             distance (km). Default False, leaving the return signature
             otherwise unchanged. Keys: 'feature_names', 'link' (always), and
             'strength' (only when `strength` is set) — each of the latter two
-            maps to {'model', 'y_test', 'probs', 'dist_km'}.
+            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges'} (edges are
+            the (u, v) node-id pairs aligned with y_test/probs/dist_km, for
+            downstream analyses keyed on node attributes like category).
 
     Returns
     -------
@@ -1114,6 +1116,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'y_test': y_test,
                 'probs': probs,
                 'dist_km': test_dist_km,
+                'edges': test_pos_kept_edges + test_neg_kept_edges,
             },
         }
 
@@ -1213,6 +1216,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'probs': str_probs,
                 'dist_km': edge_distances_km(G, str_test_edges) if G is not None
                 else np.full(len(y_str_test), np.nan),
+                'edges': str_test_edges,
             }
             return auc, embedding_map, strength_auc, diag
 

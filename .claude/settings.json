@@ -11,7 +11,8 @@
       "Bash(ls data/agg/undir_dep/tests/seed21/weight_None/)",
       "Bash(ls data/agg/undir_dep/tests/seed21/weight_dep/*emb*)",
       "Bash(jupyter nbconvert *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('pipeline.py', encoding='utf-8'\\).read\\(\\)\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('pipeline.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(python \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\59934385-a2cc-4c45-80f2-7487eecc0664\\\\scratchpad\\\\add_confusion_matrix.py\")"
     ]
   }
 }
