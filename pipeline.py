@@ -485,7 +485,7 @@ def prepare_data(
         else:
             if weight == 'num_occ':
                 G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['weight']) for u, v in train_edges])
+                    [(u, v, G[u][v]['num_occ']) for u, v in train_edges])
             elif weight == 'cov':
                 G_train.add_weighted_edges_from(
                     [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
@@ -732,7 +732,8 @@ def build_feature_matrix(
         # Binary operator applies to the entire (N, 128) array simultaneously
         emb_feat = op_fn(emb_u, emb_v)
         feature_blocks.append(emb_feat)
-        feature_names.extend(f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
+        feature_names.extend(
+            f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
     if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
         if 'cat' in features:
@@ -909,9 +910,27 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             distance (km). Default False, leaving the return signature
             otherwise unchanged. Keys: 'feature_names', 'link' (always), and
             'strength' (only when `strength` is set) — each of the latter two
-            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges'} (edges are
-            the (u, v) node-id pairs aligned with y_test/probs/dist_km, for
-            downstream analyses keyed on node attributes like category).
+            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges', 'bootstrap'}
+            (edges are the (u, v) node-id pairs aligned with y_test/probs/dist_km,
+            for downstream analyses keyed on node attributes like category;
+            'bootstrap' is None unless `bootstrap_ci` is also set).
+        bootstrap_ci : bool, optional
+            If True (and `diagnostics=True`), also bootstraps a 95% CI for each
+            head's coefficients by refitting on `n_bootstrap` resamples (with
+            replacement) of the already-built, already-standardized training
+            matrix — cheap relative to the original fit since embeddings are
+            precomputed and baked into the columns, so only the logistic
+            regression itself is repeated. Uses the original (whole-sample)
+            standardization rather than re-fitting it per resample, which is a
+            standard simplification at this scale (the mean/std are effectively
+            converged at millions of rows). Default False.
+        n_bootstrap : int, optional
+            Number of bootstrap resamples when `bootstrap_ci=True`. Default 50.
+        bootstrap_subsample : int, optional
+            If set, each bootstrap resample draws this many rows (with
+            replacement) instead of the full training-set size — trades CI
+            fidelity for speed on very large training matrices. Default None
+            (resample at the full training-set size).
 
     Returns
     -------
@@ -945,6 +964,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
     diagnostics = kwargs.get('diagnostics', False)
+    bootstrap_ci = kwargs.get('bootstrap_ci', False)
+    n_bootstrap = kwargs.get('n_bootstrap', 50)
+    bootstrap_subsample = kwargs.get('bootstrap_subsample', None)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1079,6 +1101,24 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
 
+    # ===== Bootstrap CI for coefficients (optional) =====
+    boot_ci = None
+    if diagnostics and bootstrap_ci:
+        n_samples = X_train.shape[0]
+        sub_n = bootstrap_subsample or n_samples
+        boot_coefs = np.empty((n_bootstrap, X_train.shape[1]), dtype=np.float64)
+        for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (link)', leave=False):
+            idx = np.random.randint(0, n_samples, size=sub_n)
+            bm = LogisticRegression(max_iter=1000)
+            bm.fit(X_train[idx], y_train[idx])
+            boot_coefs[b] = bm.coef_.ravel()
+        boot_ci = {
+            'ci_lower': np.percentile(boot_coefs, 2.5, axis=0),
+            'ci_upper': np.percentile(boot_coefs, 97.5, axis=0),
+            'n_bootstrap': n_bootstrap,
+            'subsample_n': sub_n,
+        }
+
     # ===== Test =====
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
         test_edges, G, features, embedding_map, operator, cat_threshold, agg)
@@ -1117,6 +1157,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'probs': probs,
                 'dist_km': test_dist_km,
                 'edges': test_pos_kept_edges + test_neg_kept_edges,
+                'bootstrap': boot_ci,
             },
         }
 
@@ -1205,6 +1246,23 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"[{feature_label}{op_label}]"
               f"  strength AUC = {strength_auc:.4f}")
 
+        str_boot_ci = None
+        if diagnostics and bootstrap_ci:
+            n_samples_s = X_train_pos.shape[0]
+            sub_n_s = bootstrap_subsample or n_samples_s
+            boot_coefs_s = np.empty((n_bootstrap, X_train_pos.shape[1]), dtype=np.float64)
+            for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (strength)', leave=False):
+                idx = np.random.randint(0, n_samples_s, size=sub_n_s)
+                bm = LogisticRegression(max_iter=1000, class_weight='balanced')
+                bm.fit(X_train_pos[idx], y_str_train[idx])
+                boot_coefs_s[b] = bm.coef_.ravel()
+            str_boot_ci = {
+                'ci_lower': np.percentile(boot_coefs_s, 2.5, axis=0),
+                'ci_upper': np.percentile(boot_coefs_s, 97.5, axis=0),
+                'n_bootstrap': n_bootstrap,
+                'subsample_n': sub_n_s,
+            }
+
         if diagnostics:
             if strength_dist_control:
                 str_test_edges = [test_edges[keep_test_pos[i]] for i in idx_te]
@@ -1217,6 +1275,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'dist_km': edge_distances_km(G, str_test_edges) if G is not None
                 else np.full(len(y_str_test), np.nan),
                 'edges': str_test_edges,
+                'bootstrap': str_boot_ci,
             }
             return auc, embedding_map, strength_auc, diag
 
