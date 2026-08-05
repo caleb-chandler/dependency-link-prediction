@@ -895,8 +895,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             If set, additionally trains a second "strength" classifier over
             positive edges only: strong (DEP above the given quantile) vs weak.
             0.5 gives a median split. The threshold is fit on train positives.
-            Reuses the same features/embeddings as the link task. Default None
-            (off), leaving the pipeline's behavior and return signature unchanged.
+            Reuses the same features/embeddings as the link task. Default None.
         strength_dist_control : bool, optional
             Only meaningful with `strength`. Distance-matches the strong/weak
             classes by binning positive edges by geographic distance and keeping
@@ -923,7 +922,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             regression itself is repeated. Uses the original (whole-sample)
             standardization rather than re-fitting it per resample, which is a
             standard simplification at this scale (the mean/std are effectively
-            converged at millions of rows). Default False.
+            converged at millions of rows). Default False.d
         n_bootstrap : int, optional
             Number of bootstrap resamples when `bootstrap_ci=True`. Default 50.
         bootstrap_subsample : int, optional
@@ -1106,7 +1105,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     if diagnostics and bootstrap_ci:
         n_samples = X_train.shape[0]
         sub_n = bootstrap_subsample or n_samples
-        boot_coefs = np.empty((n_bootstrap, X_train.shape[1]), dtype=np.float64)
+        boot_coefs = np.empty(
+            (n_bootstrap, X_train.shape[1]), dtype=np.float64)
         for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (link)', leave=False):
             idx = np.random.randint(0, n_samples, size=sub_n)
             bm = LogisticRegression(max_iter=1000)
@@ -1250,7 +1250,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if diagnostics and bootstrap_ci:
             n_samples_s = X_train_pos.shape[0]
             sub_n_s = bootstrap_subsample or n_samples_s
-            boot_coefs_s = np.empty((n_bootstrap, X_train_pos.shape[1]), dtype=np.float64)
+            boot_coefs_s = np.empty(
+                (n_bootstrap, X_train_pos.shape[1]), dtype=np.float64)
             for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (strength)', leave=False):
                 idx = np.random.randint(0, n_samples_s, size=sub_n_s)
                 bm = LogisticRegression(max_iter=1000, class_weight='balanced')
