@@ -76,10 +76,11 @@ class EmbeddingMap:
 
 
 def load(fpath, compress=False):
-    _cols = ['ORIGIN', 'DESTINATION', 'N_COVISITS', 'TAXONOMY_ORIGIN',
-             'TAXONOMY_DESTINATION', 'LAT_ORIGIN', 'LNG_ORIGIN', 'LAT_DESTINATION',
-             'LNG_DESTINATION', 'DIST_KM', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN',
-             'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION', 'DEP']
+    _cols = ["ORIGIN", "DESTINATION", "TAXONOMY_ORIGIN", "TAXONOMY_DESTINATION",
+             "GEOID_ORIGIN", "GEOID_DESTINATION", "LAT_ORIGIN", "LNG_ORIGIN",
+             "LAT_DESTINATION", "LNG_DESTINATION", "DIST_KM", "N_COVISITS",
+             "N_UIDS_ORIGIN", "N_VISITS_ORIGIN", "N_UIDS_DESTINATION",
+             "N_VISITS_DESTINATION", "DEP"]
     _dtypes = {
         'ORIGIN': 'category', 'DESTINATION': 'category',
         'TAXONOMY_ORIGIN': 'category', 'TAXONOMY_DESTINATION': 'category',
@@ -87,7 +88,7 @@ def load(fpath, compress=False):
         'LAT_DESTINATION': 'float32', 'LNG_DESTINATION': 'float32',
         'DIST_KM': 'float32', 'N_UIDS_ORIGIN': 'float32', 'N_VISITS_ORIGIN': 'float32',
         'N_UIDS_DESTINATION': 'float32', 'N_VISITS_DESTINATION': 'float32',
-        'DEP': 'float32',
+        'DEP': 'float32', 'GEOID_ORIGIN': 'str', 'GEOID_DESTINATION': 'str'
     }
     df = pd.read_csv(fpath, sep='\s+', names=_cols, dtype=_dtypes)
     df = df.dropna(subset=['ORIGIN', 'DESTINATION',
@@ -109,17 +110,17 @@ def load(fpath, compress=False):
     )
 
     # assign node attrs
-    origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN',
+    origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN', 'GEOID_ORIGIN',
                   'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
     # FIX: Align columns directly to match expected attributes ('latitude', 'longitude', 'poi_type')
-    origins.columns = ['node_id', 'latitude', 'longitude',
+    origins.columns = ['node_id', 'latitude', 'longitude', 'geoid',
                        'poi_type', 'unique_visits', 'total_visits']
 
-    destinations = df[['DESTINATION', 'LAT_DESTINATION',
-                       'LNG_DESTINATION', 'TAXONOMY_DESTINATION',
+    destinations = df[['DESTINATION', 'LAT_DESTINATION', 'LNG_DESTINATION',
+                       'GEOID_DESTINATION', 'TAXONOMY_DESTINATION',
                        'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
     # FIX: Align columns directly to match expected attributes
-    destinations.columns = ['node_id', 'latitude', 'longitude',
+    destinations.columns = ['node_id', 'latitude', 'longitude', 'geoid',
                             'poi_type', 'unique_visits', 'total_visits']
 
     # combine them into one master list of unique POIs
@@ -129,6 +130,7 @@ def load(fpath, compress=False):
     # map back to graph - convert to dict and apply
     nx.set_node_attributes(G, node_data['latitude'].to_dict(), 'latitude')
     nx.set_node_attributes(G, node_data['longitude'].to_dict(), 'longitude')
+    nx.set_node_attributes(G, node_data['geoid'].to_dict(), 'geoid')
     nx.set_node_attributes(G, node_data['poi_type'].to_dict(), 'poi_type')
     nx.set_node_attributes(
         G, node_data['unique_visits'].to_dict(), 'unique_visits')
@@ -580,7 +582,7 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def node_to_area(G, shapefile_path='data/dist/tl_2025_25_bg.shp'):
+def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
     """Add 'cbg' + 'tract' attribute to each node in G via spatial join."""
     nodes = list(G.nodes())
     lats = [G.nodes[n].get('latitude', 0) for n in nodes]
@@ -1169,9 +1171,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # ===== Strength head (optional add-on) =====
     # A second, conditional classifier over positive edges only: given a real
     # link, is its DEP above the `strength` quantile (strong) or below (weak)?
-    # Reuses the same features/embeddings as the link task — only the label
-    # differs. The quantile threshold is fit on train positives to avoid leaking
-    # the test distribution. Left off (strength=None) the pipeline is unchanged.
     if strength:
         def _dep(edges, keep):
             return np.array([G[u][v]['DEP'] for u, v in edges],
