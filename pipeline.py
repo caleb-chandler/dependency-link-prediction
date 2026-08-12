@@ -606,7 +606,7 @@ def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
 
 def node_to_comm(G):
     im = Infomap("--num-trials 20")
-    im_to_nx = im.add_networkx_graph(G, weight='N_COVISITS')
+    im_to_nx = im.add_networkx_graph(G)
     print("Running Infomap...")
     im.run()
     print("Done.")
