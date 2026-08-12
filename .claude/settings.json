@@ -14,7 +14,10 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('pipeline.py', encoding='utf-8'\\).read\\(\\)\\)\")",
       "Bash(python \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\59934385-a2cc-4c45-80f2-7487eecc0664\\\\scratchpad\\\\add_confusion_matrix.py\")",
       "Bash(python \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\b9c61f7f-0d22-4a26-91db-634c5dd20871\\\\scratchpad\\\\compare_buckets.py\")",
-      "Bash(python \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\b9c61f7f-0d22-4a26-91db-634c5dd20871\\\\scratchpad\\\\profile_dep_net_agg.py\")"
+      "Bash(python \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\b9c61f7f-0d22-4a26-91db-634c5dd20871\\\\scratchpad\\\\profile_dep_net_agg.py\")",
+      "Bash(zcat \"c:\\\\Users\\\\User\\\\Documents\\\\research\\\\dependency-link-prediction\\\\data\\\\metadata\\\\temporal_sig.csv.gz\")",
+      "Bash(zcat \"c:\\\\Users\\\\User\\\\Documents\\\\research\\\\dependency-link-prediction\\\\data\\\\metadata\\\\income_sig.csv.gz\")",
+      "Bash(zcat \"data/metadata/income_sig.csv\")"
     ]
   }
 }
