@@ -397,7 +397,7 @@ def sample_non_edges_agg_stratified(G, total_count):
         cross_dist_vals = [
             attrs['DIST_KM']
             for u, v, attrs in G.edges(data=True)
-            if node_tract.get(u) != node_tract.get(v) and attrs.get('DIST_KM') is not None
+            if node_tract.get(u) != node_tract.get(v) and pd.notna(attrs.get('DIST_KM'))
         ]
 
         if cross_dist_vals:
@@ -788,15 +788,18 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        # Fast extraction using list comprehensions (dict lookups are fast, math is slow)
-        lat_u = np.array([G.nodes[u].get('latitude')
-                         or 0.0 for u in U], dtype=np.float64)
-        lng_u = np.array([G.nodes[u].get('longitude')
-                         or 0.0 for u in U], dtype=np.float64)
-        lat_v = np.array([G.nodes[v].get('latitude')
-                         or 0.0 for v in V], dtype=np.float64)
-        lng_v = np.array([G.nodes[v].get('longitude')
-                         or 0.0 for v in V], dtype=np.float64)
+        # Fast extraction using list comprehensions (dict lookups are fast, math is slow).
+        # `or 0.0` only catches a missing/None attribute -- an existing NaN (e.g. a tract
+        # missing from the gazetteer) is truthy in Python and passes straight through, so
+        # nan_to_num is needed to actually coalesce both cases to 0.0.
+        lat_u = np.nan_to_num(np.array(
+            [G.nodes[u].get('latitude') for u in U], dtype=np.float64), nan=0.0)
+        lng_u = np.nan_to_num(np.array(
+            [G.nodes[u].get('longitude') for u in U], dtype=np.float64), nan=0.0)
+        lat_v = np.nan_to_num(np.array(
+            [G.nodes[v].get('latitude') for v in V], dtype=np.float64), nan=0.0)
+        lng_v = np.nan_to_num(np.array(
+            [G.nodes[v].get('longitude') for v in V], dtype=np.float64), nan=0.0)
 
         # Convert all coordinates to radians at once
         lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
