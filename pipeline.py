@@ -193,11 +193,7 @@ def distribution_finder(G, bins=50):
     dist_values = [v for v in dist_dict.values() if v is not None]
     if dist_values:
         max_d = max(dist_values)
-        if max_d > 0.01:
-            # Create logarithmic bins: start with 0, then exponentially space from 0.01km (10m) to max_d
-            custom_bins = np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
-        else:
-            custom_bins = np.linspace(0, max_d + 1e-5, 50)
+        custom_bins = np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
     else:
         custom_bins = bins
 
@@ -244,12 +240,12 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
     n = len(nodes)
     node_to_idx = {nd: i for i, nd in enumerate(nodes)}
 
-    lat = np.array([_coord(G.nodes[nd], 'latitude', 'lat')
+    lat = np.array([_coord(G.nodes[nd], 'latitude')
                    for nd in nodes], dtype=np.float64)
-    lng = np.array([_coord(G.nodes[nd], 'longitude', 'lon')
+    lng = np.array([_coord(G.nodes[nd], 'longitude')
                    for nd in nodes], dtype=np.float64)
 
-    # Integer-keyed edge set for faster hashing than string tuples
+    # integer-keyed edge set for faster hashing than string tuples
     edge_set_int = set()
     for u, v in G.edges():
         ui, vi = node_to_idx[u], node_to_idx[v]
@@ -272,10 +268,13 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
 
     with tqdm(total=total_count, desc='Sampling non-edges (fast)', unit='edge', leave=False) as pbar:
         while bin_filled.sum() < total_count:
+            # bin_filled is a zero-array mirroring bin_quotas to be incremented and evaluated against it
+            # this part repeats after each loop through the bins as long as while condition is met
             still_needed = np.maximum(bin_quotas - bin_filled, 0)
             if still_needed.sum() == 0:
                 break
 
+            # counts the number of rounds with no added samples
             cur_filled = int(bin_filled.sum())
             if cur_filled == prev_filled:
                 stall_rounds += 1
@@ -285,11 +284,15 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
                 stall_rounds = 0
             prev_filled = cur_filled
 
+            # create candidate pairs by elementwise combination from
+            # two 1d arrays containing random sequences of node indices
+            # batch_size determines how large they are
             ui = np.random.randint(0, n, batch_size)
             vi = np.random.randint(0, n, batch_size)
             mask = ui != vi
             ui, vi = ui[mask], vi[mask]
 
+            # compute vectorized haversine
             lat_u = np.radians(lat[ui])
             lat_v = np.radians(lat[vi])
             lng_u = np.radians(lng[ui])
@@ -302,13 +305,17 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
                 np.arctan2(np.sqrt(np.clip(a, 0.0, 1.0)),
                            np.sqrt(np.clip(1.0 - a, 0.0, 1.0)))
 
+            # array of bin indices matching distances
+            # in_range filters out edges that randomly ended up with distances > n
+            # (these would be mapped to bin_edges + 1)
             b_idx = np.digitize(dist, bins=bin_edges) - 1
-            in_range = (b_idx >= 0) & (b_idx < n_bins)
+            in_range = (b_idx < n_bins)
 
             for b in range(n_bins):
                 need = still_needed[b]
                 if need <= 0:
                     continue
+                # skip if no more candidates
                 candidates = np.where(in_range & (b_idx == b))[0]
                 if len(candidates) == 0:
                     continue
@@ -332,6 +339,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
             print(
                 f"Warning: Could not fulfill quota for bin [{iv.left:.2f}, {iv.right:.2f}]. Got {bin_filled[b]}/{bin_quotas[b]}.")
 
+    # return the raw edges as a list (bins have served their purpose)
     return [edge for bucket in bin_results for edge in bucket]
 
 
@@ -549,7 +557,6 @@ def prepare_data(
 
     G_train, test_edges, test_non_edges, train_non_edges = split(G)
 
-    # error handling
     if nx.is_empty(G_train):
         print("Error: Empty training graph.")
         return None
@@ -698,7 +705,7 @@ def build_feature_matrix(
     """
     op_fn = BINARY_OPERATORS[operator]
 
-    # Pre-filter edges missing embeddings to ensure matrix shapes align later
+    # pre-filter edges missing embeddings to ensure matrix shapes align later
     valid_edges = []
     kept_indices = []
 
@@ -714,16 +721,16 @@ def build_feature_matrix(
     if not valid_edges:
         return np.empty((0, 0)), [], []
 
-    # Unzip the list of tuples into two parallel lists of origins (U) and destinations (V)
+    # unzip the list of tuples into two parallel lists of origins (U) and destinations (V)
     U, V = zip(*valid_edges)
 
     feature_blocks = []
     feature_names = []
 
-    # Vectorized Embedding Operations
+    # vectorized embeddings
     if 'emb' in features:
-        # Extract to 2D arrays: shape (N, dim). Fancy-index the packed matrix
-        # when available; fall back to per-key lookup for plain-dict maps.
+        # extract to 2D arrays: shape (N, dim). fancy-index the packed matrix
+        # when available; fall back to per-key lookup when not.
         if hasattr(embedding_map, 'rows'):
             emb_u = embedding_map.rows(U)
             emb_v = embedding_map.rows(V)
@@ -731,7 +738,7 @@ def build_feature_matrix(
             emb_u = np.asarray([embedding_map[u] for u in U], dtype=np.float32)
             emb_v = np.asarray([embedding_map[v] for v in V], dtype=np.float32)
 
-        # Binary operator applies to the entire (N, 128) array simultaneously
+        # binary operator applies to whole array simultaneously
         emb_feat = op_fn(emb_u, emb_v)
         feature_blocks.append(emb_feat)
         feature_names.extend(
@@ -739,7 +746,7 @@ def build_feature_matrix(
 
     if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
         if 'cat' in features:
-            # Count each undirected type-pair across all edges in G
+            # count each undirected type-pair across all edges in G
             pair_counts = {}
             for eu, ev in G.edges():
                 cu = G.nodes[eu].get('poi_type', 'Unknown')
@@ -747,7 +754,7 @@ def build_feature_matrix(
                 pair = tuple(sorted([cu, cv]))
                 pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
-            # Vocabulary: only pairs observed >= cat_threshold times, sorted for stable columns
+            # only pairs observed >= cat_threshold times, sorted for stable columns
             vocab = sorted(p for p, cnt in pair_counts.items()
                            if cnt >= cat_threshold)
             print(
@@ -770,7 +777,7 @@ def build_feature_matrix(
             cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
             cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
 
-            # Boolean array comparison converted to floats: 1.0 for True, 0.0 for False
+            # boolean array comparison converted to floats: 1.0 for True, 0.0 for False
             cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
             feature_blocks.append(cat_feat)
             feature_names.append('catsame')
@@ -788,10 +795,7 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        # Fast extraction using list comprehensions (dict lookups are fast, math is slow).
-        # `or 0.0` only catches a missing/None attribute -- an existing NaN (e.g. a tract
-        # missing from the gazetteer) is truthy in Python and passes straight through, so
-        # nan_to_num is needed to actually coalesce both cases to 0.0.
+        # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
         lat_u = np.nan_to_num(np.array(
             [G.nodes[u].get('latitude') for u in U], dtype=np.float64), nan=0.0)
         lng_u = np.nan_to_num(np.array(
@@ -801,23 +805,22 @@ def build_feature_matrix(
         lng_v = np.nan_to_num(np.array(
             [G.nodes[v].get('longitude') for v in V], dtype=np.float64), nan=0.0)
 
-        # Convert all coordinates to radians at once
+        # convert all coordinates to radians at once
         lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
         lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
 
+        # calculate haversine on the 1D arrays
         dlat = lat_v_rad - lat_u_rad
         dlng = lng_v_rad - lng_u_rad
-
-        # Calculate Haversine on the 1D arrays
         a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
             np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
 
-        # Clip 'a' to [0, 1] to prevent NaN errors in sqrt due to floating-point precision limits
+        # clip 'a' to [0, 1] to prevent NaN errors in sqrt from floating-point precision limits
         a = np.clip(a, 0.0, 1.0)
 
         dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-        # Log scale and reshape to (N, 1) column vector
+        # log scale and reshape to (N, 1) column vector
         geo_feat = np.log1p(dist_km).reshape(-1, 1)
         feature_blocks.append(geo_feat)
         feature_names.append('log_dist_km')
@@ -833,7 +836,6 @@ def build_feature_matrix(
     if 'time' in features:
         # uniform distribution for fallback
         default_distr = np.array([0.25, 0.25, 0.25, 0.25])
-        # add only time
         time_u = np.array(
             [G.nodes[u].get('time_dist', default_distr) for u in U])
         time_v = np.array(
@@ -846,7 +848,6 @@ def build_feature_matrix(
     if 'income' in features:
         # uniform distribution for fallback
         default_distr = np.array([0.25, 0.25, 0.25, 0.25])
-        # add only income
         inc_u = np.array(
             [G.nodes[u].get('inc_dist', default_distr) for u in U])
         inc_v = np.array(
@@ -959,8 +960,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
-    cat_threshold = kwargs.get('cat_threshold', 1)
     # allow passing in precomputed embeddings
+    cat_threshold = kwargs.get('cat_threshold', 1)
     embedding_map = kwargs.get('embedding_map', None)
     # switch for weighted/directed version
     weighted = kwargs.get('weighted', False)
@@ -1014,18 +1015,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             else:
                 raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
 
-        tried_modes = [mode]
+        # set an order in which to try modes
+        modes_to_try = [mode]
         if mode != 'PreComp':
-            tried_modes.append('PreComp')
+            modes_to_try.append('PreComp')
         if mode not in ['SparseOTF', 'DenseOTF']:
-            tried_modes.append('DenseOTF')
+            modes_to_try.append('DenseOTF')
         # PreComp alias_indptr overflows uint32 for large weighted graphs;
-        # SparseOTF computes transition probs on-the-fly and avoids this.
-        if weighted and 'SparseOTF' not in tried_modes:
-            tried_modes.insert(0, 'SparseOTF')
+        # SparseOTF computes transition probs on-the-fly and avoids this
+        # insert() puts it at the front of the queue if it isnt already
+        if weighted and 'SparseOTF' not in modes_to_try:
+            modes_to_try.insert(0, 'SparseOTF')
 
         last_exception = None
-        for candidate_mode in tried_modes:
+        for candidate_mode in modes_to_try:
             try:
                 g = make_pecanpy_graph(candidate_mode, weighted)
                 g.read_edg(trainfile, weighted=weighted,
@@ -1040,26 +1043,28 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 )
 
                 if candidate_mode != mode:
-                    print(f"Warning: fell back to '{candidate_mode}'")
+                    print(f"Notice: fell back to '{candidate_mode}'")
                 break
             except Exception as e:
-                print(f"Warning: pecanpy mode '{candidate_mode}' failed: {e}")
+                print(f"Notice: pecanpy mode '{candidate_mode}' failed: {e}")
                 last_exception = e
                 continue
         else:
             raise RuntimeError(
-                f"Pecanpy walk generation failed for all modes: {tried_modes}"
+                f"Pecanpy walk generation failed for all modes"
             ) from last_exception
 
-        # Store as a packed float32 matrix + index (str keys stay consistent
-        # with graph node IDs) instead of a dict of Python lists — ~8x less RAM.
+        # convert to EmbeddingMap object
         embedding_map = EmbeddingMap.from_pecanpy(g.nodes, embeddings)
 
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
 
     # ===== Assemble feature matrices =====
+
+    # convert to list and sort for consisten indexing
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
 
+    # TODO: remove and rework
     if ('cbg' in features or 'tract' in features) and not agg:
         node_to_area(G)
 
@@ -1080,32 +1085,29 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.ones(len(X_train_pos)),
         np.zeros(len(X_train_neg))
     ])
+
+    # remove to save memory if no longer needed
     if not strength:
         del X_train_pos, X_train_neg
     else:
         del X_train_neg
 
-    # No shuffle: lbfgs is a batch solver and order-invariant, so the row
-    # permutation only cost a full extra copy of the matrix at peak RAM.
-
     print(
         f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
 
     # ===== Train =====
-    # Standardize in float32, in place. StandardScaler upcasts to float64
-    # (2x RAM on a multi-GB matrix); lbfgs LogisticRegression keeps float32,
-    # so hand-rolling the z-score avoids the float64 blowup entirely. Stats are
-    # accumulated in float64 for numerical stability, then cast back.
+    # bypass StandardScaler float64 upcasting by z-scoring in place. stats are
+    # accumulated in float64 for numerical stability, then cast back
     train_mean = X_train.mean(axis=0, dtype=np.float64).astype(np.float32)
     train_std = X_train.std(axis=0, dtype=np.float64).astype(np.float32)
-    train_std[train_std == 0] = 1.0
+    train_std[train_std == 0] = 1.0  # arbitrary stand-in to avoid div by 0
     X_train -= train_mean
     X_train /= train_std
 
     model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
 
-    # ===== Bootstrap CI for coefficients (optional) =====
+    # ===== bootstrap CI for coefficients (optional) =====
     boot_ci = None
     if diagnostics and bootstrap_ci:
         n_samples = X_train.shape[0]
@@ -1136,7 +1138,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.zeros(len(X_test_neg))
     ])
 
-    # Apply the training z-score to the test matrix in place (same reason as above)
+    # apply the training z-score to the test matrix in place (same reason as above)
     X_test -= train_mean
     X_test /= train_std
 
@@ -1145,6 +1147,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     diag = None
     if diagnostics:
+        # the edge_indices returns are integer positions; this finds the actual edges from them
         test_pos_kept_edges = [test_edges[i] for i in keep_test_pos]
         test_neg_kept_edges = [test_non_edges[i] for i in keep_test_neg]
         if G is not None:
@@ -1166,38 +1169,41 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             },
         }
 
-    # ===== Report =====
+    # ===== report =====
     feature_label = '+'.join(features)
     op_label = f" ({operator})" if 'emb' in features else ""
     print(f"[{feature_label}{op_label}]  AUC = {auc:.4f}")
 
-    # ===== Strength head (optional add-on) =====
-    # A second, conditional classifier over positive edges only: given a real
-    # link, is its DEP above the `strength` quantile (strong) or below (weak)?
+    # ===== strength head =====
     if strength:
+        # function to return dependencies of kept edges only
         def _dep(edges, keep):
             return np.array([G[u][v]['DEP'] for u, v in edges],
                             dtype=np.float64)[keep]
 
+        # distance-controlled sampler (strength version)
         def _dist_matched_idx(dep, dist, thr):
-            # Bin positives by distance (same log bins as the non-edge sampler),
-            # then keep min(#strong, #weak) from each bin so the two classes
-            # share a distance distribution and distance can't predict strength.
+            # same log bins as the link version, then keep min(#strong, #weak)
             strong = dep > thr
             if dist.max() > 0.01:
                 edges_b = np.concatenate(
                     ([0], np.geomspace(0.01, dist.max(), 50)))
             else:
                 edges_b = np.linspace(0, dist.max() + 1e-5, 50)
+            # indexes the bin that each edge falls into
             b = np.digitize(dist, edges_b)
             keep = []
             for bin_id in np.unique(b):
+                # strong and weak within bin (returns indices)
                 in_bin = np.where(b == bin_id)[0]
                 s = in_bin[strong[in_bin]]
                 w = in_bin[~strong[in_bin]]
                 k = min(len(s), len(w))
                 if k == 0:
                     continue
+                # select k random samples from within-bin subsets w/o replacement
+                # (smaller one technically just gets copied but its fast enough
+                # that the redundancy doesn't matter)
                 keep.extend(np.random.choice(s, k, replace=False))
                 keep.extend(np.random.choice(w, k, replace=False))
             return np.sort(np.array(keep, dtype=int))
@@ -1216,6 +1222,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             idx_te = _dist_matched_idx(
                 dep_test, edge_distances_km(
                     G, [test_edges[i] for i in keep_test_pos]), thr)
+            # filter to sampled edges
             X_train_pos = X_train_pos[idx_tr]
             X_test_pos = X_test_pos[idx_te]
             y_str_train = y_str_train[idx_tr]
@@ -1229,8 +1236,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 return (auc, embedding_map, float('nan'), diag) if diagnostics \
                     else (auc, embedding_map, float('nan'))
 
-        # Same float32 in-place standardization as the link head (avoids the
-        # StandardScaler float64 upcast on the positive-edge matrix).
+        # same float32 in-place standardization as before
         str_mean = X_train_pos.mean(
             axis=0, dtype=np.float64).astype(np.float32)
         str_std = X_train_pos.std(axis=0, dtype=np.float64).astype(np.float32)
