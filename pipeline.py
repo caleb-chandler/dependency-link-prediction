@@ -21,17 +21,12 @@ from scipy.spatial.distance import jensenshannon
 class EmbeddingMap:
     """Memory-efficient node embedding store.
 
-    Keeps embeddings as a single contiguous float32 matrix plus a
-    ``node_id -> row_index`` dict, instead of a dict of Python lists. This is
-    ~8x smaller in RAM (float32 packed vs. boxed Python floats + list
-    pointers) and lets feature construction fancy-index rows without a
-    float64 detour. Storing float32 is lossless: pecanpy/gensim emit float32
-    and the feature matrix is cast to float32 downstream anyway.
+    Takes node list and embedding matrix outputted by pecanpy and converts to 
+    float32 matrix plus node:row index dict. filters out None entries in the node 
+    list so that the matrix is smaller than the input embeddings array.
 
-    Exposes a dict-like interface (``in``, ``[]``, ``len``, ``keys``) so
-    existing call sites — including the precomputed path and the returned
-    value — keep working unchanged. Plain dicts saved by older runs still
-    work everywhere too (build_feature_matrix falls back to per-key lookup).
+    Allows for fancy indexing without creating an unnecessary memory-intensive 
+    copy in float64 (which pecanpy doesn't make or need) via .rows() method.
     """
 
     __slots__ = ('matrix', 'idx_of')
@@ -112,14 +107,13 @@ def load(fpath, compress=False):
     # assign node attrs
     origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN', 'GEOID_ORIGIN',
                   'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
-    # FIX: Align columns directly to match expected attributes ('latitude', 'longitude', 'poi_type')
+    # align columns directly to match expected attributes
     origins.columns = ['node_id', 'latitude', 'longitude', 'geoid',
                        'poi_type', 'unique_visits', 'total_visits']
 
     destinations = df[['DESTINATION', 'LAT_DESTINATION', 'LNG_DESTINATION',
                        'GEOID_DESTINATION', 'TAXONOMY_DESTINATION',
                        'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
-    # FIX: Align columns directly to match expected attributes
     destinations.columns = ['node_id', 'latitude', 'longitude', 'geoid',
                             'poi_type', 'unique_visits', 'total_visits']
 
