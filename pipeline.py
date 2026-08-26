@@ -580,8 +580,8 @@ def build_feature_matrix(
 
     # vectorized embeddings
     if 'emb' in features:
-        # extract to 2D arrays: shape (N, dim). fancy-index the packed matrix
-        # when available; fall back to per-key lookup when not.
+        # extract to 2D arrays: shape (N_pairs, dim). one for each endpoint.
+        # fancy-index the packed matrix when available; fall back to per-key lookup when not.
         if hasattr(embedding_map, 'rows'):
             emb_u = embedding_map.rows(U)
             emb_v = embedding_map.rows(V)
@@ -647,16 +647,16 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        if not agg:
+        if 'latitude' in G:
             # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
             lat_u = np.nan_to_num(np.array(
-                [G.nodes[u].get('latitude') for u in U], dtype=np.float64), nan=0.0)
+                [G.nodes[u].get('latitude') for u in U], dtype=np.float32))
             lng_u = np.nan_to_num(np.array(
-                [G.nodes[u].get('longitude') for u in U], dtype=np.float64), nan=0.0)
+                [G.nodes[u].get('longitude') for u in U], dtype=np.float32))
             lat_v = np.nan_to_num(np.array(
-                [G.nodes[v].get('latitude') for v in V], dtype=np.float64), nan=0.0)
+                [G.nodes[v].get('latitude') for v in V], dtype=np.float32))
             lng_v = np.nan_to_num(np.array(
-                [G.nodes[v].get('longitude') for v in V], dtype=np.float64), nan=0.0)
+                [G.nodes[v].get('longitude') for v in V], dtype=np.float32))
 
             # convert all coordinates to radians at once
             lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
@@ -674,9 +674,50 @@ def build_feature_matrix(
             dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
             # log scale and reshape to (n_pairs, 1) column vector
-            geo_feat = np.log1p(dist_km).reshape(-1, 1)
-            feature_blocks.append(geo_feat)
+            dist_feat = np.log1p(dist_km).reshape(-1, 1)
+            feature_blocks.append(dist_feat)
             feature_names.append('log_dist_km')
+        elif 'COORDS_ARR' in G:
+            ''' 
+            point is to get a column of mean distances for all pairs as dist_feat
+
+            so i think i might need to get an array of lat/lon for each node first (could be from G itself)
+            and then create a new array holding distances of all possible combinations of lat/lon pairs
+
+            i would then stack it vertically with a column for each pair, then do np.mean or whatever else to
+            convert it to a single row, then turn the row into a column that becomes dist_feat
+            '''
+            all_comb_u = []
+            all_comb_v = []
+            pair_indices = []
+
+            # go back to valid_edges since we're looping
+            for i, (u, v) in enumerate(valid_edges):
+                latlons_u = np.nan_to_num(G.nodes[u].get(
+                    'COORDS_ARR')).astype(np.float32)
+                latlons_v = np.nan_to_num(G.nodes[v].get(
+                    'COORDS_ARR')).astype(np.float32)
+
+                # np.arange creates an array of indices for each row
+                # np.meshgrid then creates an array with each possible combination represented element-wise
+                grid_u, grid_v = np.meshgrid(
+                    np.arange(latlons_u.shape[0]), np.arange(latlons_v.shape[0]), indexing='ij'
+                )
+
+                # ravel flattens the matrices (still matched element-wise), and indexes the arrays with them
+                # this results in the first array repeating elements once for each element in the second array,
+                # creating two (N, 2) arrays with all combinations by index (N = rows in latlons_u X rows in latlons_v)
+                all_comb_u.append(latlons_u[grid_u.ravel()])
+                all_comb_v.append([grid_v.ravel()])
+
+                # record how many combinations this pair generated as a 1d array matching the length of the all_comb arrays
+                num_comb = grid_u.size
+                pair_indices.append(np.full(num_comb, i))
+
+            # convert to supertall 2-col arrays indexed by pair_indices
+            all_comb_u = np.vstack(all_comb_u)
+            all_comb_v = np.vstack(all_comb_v)
+            pair_indices = np.concatenate(pair_indices)
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
@@ -726,7 +767,7 @@ def build_feature_matrix(
 def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
                  mode='PreComp', operator='hadamard', agg=False, **kwargs):
     """
-    Run the link prediction pipeline with flexible feature composition. Features are controlled by the `features` list.
+    Run the link prediction pipeline with flexible feature composition. Features controlled by `features` list.
 
     Parameters
     ----------
@@ -760,29 +801,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             classes by binning positive edges by geographic distance and keeping
             min(#strong, #weak) per bin, so distance carries no marginal signal
             about strength. If a class empties out after matching,
-            strength_auc is nan. Default False.
-        diagnostics : bool, optional
-            If True, additionally returns a dict for building a regression
-            table + error analysis: fitted model(s), feature names, test
-            labels/predicted probabilities, and per-test-edge geographic
-            distance (km). Keys: 'feature_names', 'link' (always), and
-            'strength' (only when `strength` is set) — each of the latter two
-            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges'}
-            (edges are the (u, v) node-id pairs aligned with y_test/probs/dist_km,
-            for downstream analyses keyed on node attributes like category). 
-            Default False.
+            str_auc is nan. Default False.
 
     Returns
     -------
-    auc : float
+    link_auc : float
         AUC score for the specified feature/operator combination.
+    link_model : sm.Logit()
+        Trained model for later analysis.
     embedding_map : dict or None
         Node embeddings (only populated when 'emb' in features).
-    strength_auc : float
-        Only returned when `strength` is set — AUC of the strong-vs-weak
-        classifier on the positive test edges.
-    diagnostics : dict
-        Only returned when `diagnostics=True` (always the last return value).
+    str_auc : float
+        AUC score for the specified feature/operator combination.
+    str_model : sm.Logit()
+        Trained model for later analysis.
     """
     # === unpacking kwargs ===
     # hyperparameters
@@ -803,7 +835,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
-    diagnostics = kwargs.get('diagnostics', False)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1049,11 +1080,11 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
         str_model = sm.Logit(y_str_train, X_train_pos).fit()
         str_probs = str_model.predict(X_test_pos)
-        strength_auc = roc_auc_score(y_str_test, str_probs)
+        str_auc = roc_auc_score(y_str_test, str_probs)
 
         print(f"[{feature_label}{op_label}]"
-              f"  strength AUC = {strength_auc:.4f}")
+              f"  strength AUC = {str_auc:.4f}")
 
-        return link_auc, link_model, embedding_map, strength_auc, str_model
+        return link_auc, link_model, embedding_map, str_auc, str_model
 
     return link_auc, link_model, embedding_map
