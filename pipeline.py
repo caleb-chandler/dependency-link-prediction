@@ -596,6 +596,7 @@ def build_feature_matrix(
             f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
     if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
+        print('Make sure you remember to not standardize dummies')
         if 'cat' in features:
             # count each undirected type-pair across all edges in G
             pair_counts = {}
@@ -926,21 +927,40 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
 
     # ===== Train =====
-    # bypass StandardScaler float64 upcasting by z-scoring in place. stats are
-    # accumulated in float64 for numerical stability, then cast back
-    train_mean = X_train.mean(axis=0, dtype=np.float64).astype(np.float32)
-    train_std = X_train.std(axis=0, dtype=np.float64).astype(np.float32)
-    train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
-    X_train -= train_mean
-    X_train /= train_std
 
-    model = LogisticRegression(max_iter=1000)
-    model.fit(X_train, y_train)
+    def standardize(train_set):
+        ''' 
+        Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+        Stats are accumulated in float64 for numerical stability, then cast back.
+        '''
+        # mask for dummmy variables to bypass standardization
+        is_dummy = train_set.apply(lambda col: set(
+            col.dropna().unique()).issubset({0.0, 1.0, 0, 1}))
+        standardizable = train_set.columns[~is_dummy]
+
+        train_mean = train_set[standardizable].mean(
+            axis=0, dtype=np.float64).astype(np.float32)
+        train_std = train_set[standardizable].std(
+            axis=0, dtype=np.float64).astype(np.float32)
+
+        train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
+        train_set[standardizable] -= train_mean
+        train_set[standardizable] /= train_std
+
+        return train_set, train_mean, train_std
+
+    X_train, train_mean, train_std = standardize(X_train)
+
+    # add constant, fit model, and print out description
+    sm.add_constant(X_train)
+    link_model = sm.Logit(y_train, X_train).fit()
+    print(link_model.summary())
 
     # ===== Test =====
+
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
         test_edges, G, features, embedding_map, operator, cat_threshold, agg)
-    X_test_neg, keep_test_neg, _ = build_feature_matrix(
+    X_test_neg, _, _ = build_feature_matrix(
         test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
@@ -953,36 +973,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     X_test -= train_mean
     X_test /= train_std
 
-    probs = model.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, probs)
+    probs = link_model.predict(X_test)
+    link_auc = roc_auc_score(y_test, probs)
 
-    diag = None
-    if diagnostics:
-        # the edge_indices returns are integer positions; this finds the actual edges from them
-        test_pos_kept_edges = [test_edges[i] for i in keep_test_pos]
-        test_neg_kept_edges = [test_non_edges[i] for i in keep_test_neg]
-        if G is not None:
-            test_dist_km = np.concatenate([
-                edge_distances_km(G, test_pos_kept_edges),
-                edge_distances_km(G, test_neg_kept_edges),
-            ])
-        else:
-            test_dist_km = np.full(len(y_test), np.nan)
-        diag = {
-            'feature_names': feature_names,
-            'link': {
-                'model': model,
-                'y_test': y_test,
-                'probs': probs,
-                'dist_km': test_dist_km,
-                'edges': test_pos_kept_edges + test_neg_kept_edges,
-            },
-        }
-
-    # ===== report =====
+    # --- report ---
     feature_label = '+'.join(features)
     op_label = f" ({operator})" if 'emb' in features else ""
-    print(f"[{feature_label}{op_label}]  AUC = {auc:.4f}")
+    print(f"[{feature_label}{op_label}]  AUC = {link_auc:.4f}")
 
     # ===== strength head =====
     if strength:
@@ -1043,42 +1040,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
                 print("Warning: a strength class vanished after distance "
                       "matching — cannot score. Returning nan.")
-                return (auc, embedding_map, float('nan'), diag) if diagnostics \
-                    else (auc, embedding_map, float('nan'))
+                return (link_auc, link_model, embedding_map, float('nan'), None)
 
         # same float32 in-place standardization as before
-        str_mean = X_train_pos.mean(
-            axis=0, dtype=np.float64).astype(np.float32)
-        str_std = X_train_pos.std(axis=0, dtype=np.float64).astype(np.float32)
-        str_std[str_std == 0] = 1.0
-        X_train_pos -= str_mean
-        X_train_pos /= str_std
+        X_train_pos, str_mean, str_std = standardize(X_train_pos)
         X_test_pos -= str_mean
         X_test_pos /= str_std
 
-        str_model = LogisticRegression(max_iter=1000, class_weight='balanced')
-        str_model.fit(X_train_pos, y_str_train)
-        str_probs = str_model.predict_proba(X_test_pos)[:, 1]
+        str_model = sm.Logit(y_str_train, X_train_pos).fit()
+        str_probs = str_model.predict(X_test_pos)
         strength_auc = roc_auc_score(y_str_test, str_probs)
 
         print(f"[{feature_label}{op_label}]"
               f"  strength AUC = {strength_auc:.4f}")
 
-        if diagnostics:
-            if strength_dist_control:
-                str_test_edges = [test_edges[keep_test_pos[i]] for i in idx_te]
-            else:
-                str_test_edges = [test_edges[i] for i in keep_test_pos]
-            diag['strength'] = {
-                'model': str_model,
-                'y_test': y_str_test,
-                'probs': str_probs,
-                'dist_km': edge_distances_km(G, str_test_edges) if G is not None
-                else np.full(len(y_str_test), np.nan),
-                'edges': str_test_edges,
-            }
-            return auc, embedding_map, strength_auc, diag
+        return link_auc, link_model, embedding_map, strength_auc, str_model
 
-        return auc, embedding_map, strength_auc
-
-    return (auc, embedding_map, diag) if diagnostics else (auc, embedding_map)
+    return link_auc, link_model, embedding_map
