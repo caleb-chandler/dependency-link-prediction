@@ -6,12 +6,12 @@ import random
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from tqdm.auto import tqdm
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
 import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
+import statsmodels.api as sm
+
 
 # ===================================================================
 # EMBEDDING STORE
@@ -71,23 +71,16 @@ class EmbeddingMap:
 
 
 def load(fpath, compress=False):
-    _cols = ["ORIGIN", "DESTINATION", "TAXONOMY_ORIGIN", "TAXONOMY_DESTINATION",
-             "GEOID_ORIGIN", "GEOID_DESTINATION", "LAT_ORIGIN", "LNG_ORIGIN",
-             "LAT_DESTINATION", "LNG_DESTINATION", "DIST_KM", "N_COVISITS",
-             "N_UIDS_ORIGIN", "N_VISITS_ORIGIN", "N_UIDS_DESTINATION",
-             "N_VISITS_DESTINATION", "DEP"]
+    # downcast for better performance
     _dtypes = {
-        'ORIGIN': 'category', 'DESTINATION': 'category',
-        'TAXONOMY_ORIGIN': 'category', 'TAXONOMY_DESTINATION': 'category',
-        'N_COVISITS': 'float32', 'LAT_ORIGIN': 'float32', 'LNG_ORIGIN': 'float32',
-        'LAT_DESTINATION': 'float32', 'LNG_DESTINATION': 'float32',
-        'DIST_KM': 'float32', 'N_UIDS_ORIGIN': 'float32', 'N_VISITS_ORIGIN': 'float32',
-        'N_UIDS_DESTINATION': 'float32', 'N_VISITS_DESTINATION': 'float32',
-        'DEP': 'float32', 'GEOID_ORIGIN': 'str', 'GEOID_DESTINATION': 'str'
+        'NODE_A': 'category', 'NODE_B': 'category',
+        'N_COVISITS': 'float32', 'DIST_KM_MIN': 'float32',
+        'DIST_KM_MEAN': 'float32', 'N_UIDS_A': 'float32',
+        'N_POIS_A': 'float32', 'N_VISITS_A': 'float32',
+        'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
+        'N_VISITS_B': 'float32', 'DEP': 'float32'
     }
-    df = pd.read_csv(fpath, sep='\s+', names=_cols, dtype=_dtypes)
-    df = df.dropna(subset=['ORIGIN', 'DESTINATION',
-                   'TAXONOMY_ORIGIN', 'TAXONOMY_DESTINATION'])
+    df = pd.read_csv(fpath, dtype=_dtypes)
 
     # optional log-compression
     if compress:
@@ -99,37 +92,24 @@ def load(fpath, compress=False):
 
     G = nx.from_pandas_edgelist(
         df,
-        source='ORIGIN',
-        target='DESTINATION',
-        edge_attr=['DIST_KM', 'DEP', 'N_COVISITS'],
+        source='NODE_A',
+        target='NODE_B',
+        edge_attr=['SELF_LOOP', 'DIST_KM_MIN',
+                   'DIST_KM_MEAN', 'N_COVISITS', 'DEP'],
     )
 
     # assign node attrs
-    origins = df[['ORIGIN', 'LAT_ORIGIN', 'LNG_ORIGIN', 'GEOID_ORIGIN',
-                  'TAXONOMY_ORIGIN', 'N_UIDS_ORIGIN', 'N_VISITS_ORIGIN']].drop_duplicates()
-    # align columns directly to match expected attributes
-    origins.columns = ['node_id', 'latitude', 'longitude', 'geoid',
-                       'poi_type', 'unique_visits', 'total_visits']
+    def node_attr(a_col, b_col):
+        return pd.concat([
+            df.set_index('NODE_A')[a_col],
+            df.set_index('NODE_B')[b_col],
+        ]).groupby(level=0).first().to_dict()
 
-    destinations = df[['DESTINATION', 'LAT_DESTINATION', 'LNG_DESTINATION',
-                       'GEOID_DESTINATION', 'TAXONOMY_DESTINATION',
-                       'N_UIDS_DESTINATION', 'N_VISITS_DESTINATION']].drop_duplicates()
-    destinations.columns = ['node_id', 'latitude', 'longitude', 'geoid',
-                            'poi_type', 'unique_visits', 'total_visits']
-
-    # combine them into one master list of unique POIs
-    node_data = pd.concat([origins, destinations]).drop_duplicates(
-        'node_id').set_index('node_id')
-
-    # map back to graph - convert to dict and apply
-    nx.set_node_attributes(G, node_data['latitude'].to_dict(), 'latitude')
-    nx.set_node_attributes(G, node_data['longitude'].to_dict(), 'longitude')
-    nx.set_node_attributes(G, node_data['geoid'].to_dict(), 'geoid')
-    nx.set_node_attributes(G, node_data['poi_type'].to_dict(), 'poi_type')
-    nx.set_node_attributes(
-        G, node_data['unique_visits'].to_dict(), 'unique_visits')
-    nx.set_node_attributes(
-        G, node_data['total_visits'].to_dict(), 'total_visits')
+    # apply returned Series per attr
+    nx.set_node_attributes(G, node_attr('N_UIDS_A', 'N_UIDS_B'), 'N_UIDS')
+    nx.set_node_attributes(G, node_attr('N_POIS_A', 'N_POIS_B'), 'N_POIS')
+    nx.set_node_attributes(G, node_attr(
+        'N_VISITS_A', 'N_VISITS_B'), 'N_VISITS')
 
     print(f"Nodes: {G.number_of_nodes()}")
     print(f"Edges: {G.number_of_edges()}")
@@ -141,25 +121,23 @@ def load(fpath, compress=False):
 # ================================================================
 
 
-def distribution_finder(G, bins=50):
-    # --- helper: continuous data (bins) ---
-    def get_binned_dist(data_dict, bins):
-        if not data_dict:
-            return pd.Series(dtype='float64'), {}
+def distribution_finder(G, dist_type, n_bins):
+    ''' 
+    Finds distance distribution by binning and counting number of occurrences per bin.
+
+    Returns distribution as pd.Series indexed by bin, as well as dict mapping nodes
+    to their respective intervals.
+    '''
+    # --- helper: binning ---
+    def get_binned_dist(data_dict, bin_edges):
 
         # convert dict to series. index = node id or edge tuple, value = attribute
         s = pd.Series(data_dict).dropna()
 
-        # if bins is an integer, let numpy calculate linear edges. otherwise, use custom edges.
-        if isinstance(bins, int):
-            _, bin_edges = np.histogram(s, bins=bins)
-        else:
-            bin_edges = bins
-
-        # cut the data into bins. this returns true interval objects
+        # cut the data into bins. this returns Interval objects
         binned = pd.cut(s, bins=bin_edges, include_lowest=True)
 
-        # The distribution is the count of edges in each Interval
+        # the distribution is the count of edges in each Interval
         distr = binned.value_counts().sort_index()
 
         # group by the bin intervals and extract the ids as a set
@@ -169,60 +147,33 @@ def distribution_finder(G, bins=50):
 
         return distr, elements_by_bin
 
-    # --- helper: discrete/categorical data ---
-    def get_discrete_dist(data_dict):
-        if not data_dict:
-            return pd.Series(dtype='float64'), {}
+    # --- applying function ---
 
-        s = pd.Series(data_dict)
-        distr = s.value_counts().sort_index()
+    if dist_type == 'mean':
+        dist_dict = nx.get_edge_attributes(G, 'DIST_KM_MEAN')
+    elif dist_type == 'min':
+        dist_dict = nx.get_edge_attributes(G, 'DIST_KM_MIN')
+    elif dist_type == 'poi_level':
+        dist_dict = nx.get_edge_attributes(G, 'DIST_KM')
+    else:
+        raise SystemExit(
+            'Error: invalid distance type (from distribution_finder)')
 
-        # group exactly by the value
-        elements_by_val = s.groupby(s).apply(lambda x: set(x.index)).to_dict()
-
-        return distr, elements_by_val
-
-    # --- edges: distance (continuous) ---
-    dist_dict = nx.get_edge_attributes(G, 'DIST_KM')
     dist_values = [v for v in dist_dict.values() if v is not None]
     if dist_values:
         max_d = max(dist_values)
-        custom_bins = np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
+        log_bins = np.concatenate(([0], np.geomspace(0.01, max_d, n_bins)))
     else:
-        custom_bins = bins
+        raise SystemExit(
+            'Error: no distance values found (from distribution_finder)')
 
-    dist_distr, dist_edges_set = get_binned_dist(
-        {k: v for k, v in dist_dict.items() if v is not None}, custom_bins)
+    distribution, element_set = get_binned_dist(
+        {k: v for k, v in dist_dict.items() if v is not None}, log_bins)
 
-    # --- nodes: categorical (poi type) ---
-    type_dict = {u: data.get('poi_type', 'Unknown')
-                 for u, data in G.nodes(data=True)}
-    type_distr, type_nodes_set = get_discrete_dist(type_dict)
-
-    # --- nodes: unique visits (continuous) ---
-    uv_dict = {u: data.get('unique_visits', 0)
-               for u, data in G.nodes(data=True)}
-    uv_distr, uv_nodes_set = get_binned_dist(uv_dict, bins)
-
-    # --- nodes: total visits (continuous) ---
-    tv_dict = {u: data.get('total_visits', 0)
-               for u, data in G.nodes(data=True)}
-    tv_distr, tv_nodes_set = get_binned_dist(tv_dict, bins)
-
-    # --- topology: degree (discrete) ---
-    deg_dict = dict(G.degree())
-    deg_distr, deg_nodes_set = get_discrete_dist(deg_dict)
-
-    # pack the results logically so it's easy to return
-    distributions = (dist_distr, type_distr,
-                     uv_distr, tv_distr, deg_distr)
-    element_sets = (dist_edges_set, type_nodes_set,
-                    uv_nodes_set, tv_nodes_set, deg_nodes_set)
-
-    return distributions, element_sets
+    return distribution, element_set
 
 
-def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000):
+def dist_controlled_sampler(G, distr, total_count, batch_size=2_000_000):
     def _coord(attrs, *keys):
         for k in keys:
             v = attrs.get(k)
@@ -243,6 +194,7 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
     edge_set_int = set()
     for u, v in G.edges():
         ui, vi = node_to_idx[u], node_to_idx[v]
+        # set so that lower idx is always first
         edge_set_int.add((ui, vi) if ui < vi else (vi, ui))
 
     bin_intervals = list(distr.index)
@@ -263,7 +215,8 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
     with tqdm(total=total_count, desc='Sampling non-edges (fast)', unit='edge', leave=False) as pbar:
         while bin_filled.sum() < total_count:
             # bin_filled is a zero-array mirroring bin_quotas to be incremented and evaluated against it
-            # this part repeats after each loop through the bins as long as while condition is met
+            # this part repeats after each loop through the bins as long as the bins haven't been filled
+            # to the requested amount
             still_needed = np.maximum(bin_quotas - bin_filled, 0)
             if still_needed.sum() == 0:
                 break
@@ -337,100 +290,14 @@ def sample_non_edges_dist_controlled(G, distr, total_count, batch_size=2_000_000
     return [edge for bucket in bin_results for edge in bucket]
 
 
-def sample_non_edges_agg_stratified(G, total_count):
-    """
-    Non-edge sampler for aggregated (cat||tract) networks.
-
-    Same-tract pairs share a centroid (DIST_KM=0), so spatial sampling can't
-    fill the 0-distance bins — the within-tract graph is too dense. This sampler
-    enumerates same-tract non-edges directly, then uses distance-controlled bulk
-    sampling for cross-tract pairs, with the quota split proportional to the
-    same-tract / cross-tract ratio in the actual edge set.
-    """
-    node_tract = {}
-    for node in G.nodes():
-        parts = str(node).split('||')
-        node_tract[node] = parts[1] if len(parts) == 2 else None
-
-    same_count, cross_count = 0, 0
-    for u, v in G.edges():
-        tu, tv = node_tract.get(u), node_tract.get(v)
-        if tu is not None and tu == tv:
-            same_count += 1
-        else:
-            cross_count += 1
-
-    total_edges = same_count + cross_count
-    if total_edges == 0:
-        return []
-
-    same_quota = int(round((same_count / total_edges) * total_count))
-    cross_quota = total_count - same_quota
-
-    # same-tract: enumerate all missing category pairs per tract directly
-    tract_to_nodes = {}
-    for node in G.nodes():
-        t = node_tract.get(node)
-        if t is not None:
-            tract_to_nodes.setdefault(t, []).append(node)
-
-    pool = []
-    for nodes in tract_to_nodes.values():
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                u, v = nodes[i], nodes[j]
-                if not G.has_edge(u, v):
-                    pool.append((u, v))
-
-    if len(pool) <= same_quota:
-        same_sample = pool
-        shortfall = same_quota - len(pool)
-        if shortfall > 0:
-            print(f"Warning: only {len(pool)} same-tract non-edges available "
-                  f"(needed {same_quota}). Redistributing {shortfall} to cross-tract.")
-            cross_quota += shortfall
-    else:
-        same_sample = random.sample(pool, same_quota)
-
-    # cross-tract: build a distance distribution from cross-tract edges only,
-    # then delegate to the standard distance-controlled sampler
-    cross_non_edges = []
-    if cross_quota > 0:
-        cross_dist_vals = [
-            attrs['DIST_KM']
-            for u, v, attrs in G.edges(data=True)
-            if node_tract.get(u) != node_tract.get(v) and pd.notna(attrs.get('DIST_KM'))
-        ]
-
-        if cross_dist_vals:
-            max_d = max(cross_dist_vals)
-            bin_edges = (
-                np.concatenate(([0], np.geomspace(0.01, max_d, 50)))
-                if max_d > 0.01 else np.linspace(0, max_d + 1e-5, 50)
-            )
-            cross_dist_distr = (
-                pd.cut(pd.Series(cross_dist_vals),
-                       bins=bin_edges, include_lowest=True)
-                .value_counts().sort_index()
-            )
-            cross_non_edges = sample_non_edges_dist_controlled(
-                G, cross_dist_distr, cross_quota)
-            # drop any same-tract pairs (distance=0) that landed in the first bin
-            cross_non_edges = [
-                (u, v) for u, v in cross_non_edges
-                if node_tract.get(u) != node_tract.get(v)
-            ]
-
-    return same_sample + cross_non_edges
-
-
 # ====================================================================
 # PREPARE_DATA
 # ====================================================================
 
 
 def prepare_data(
-    fpath, frac=0.5, seed=None, agg=False, compress=0, weight=None, meta=None, trainfile='train.txt', controlled=True
+    fpath, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, meta=None,
+    trainfile='data/train.txt', controlled=True, n_bins=50, dist_type='mean'
 ):
     """
     Prepare data for link prediction pipeline.
@@ -441,7 +308,7 @@ def prepare_data(
 
     Parameters:
     fpath (str): Path to the graph file. Must be readable as an edgelist.
-    frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
+    test_frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
     seed (int, optional): Seed for reproducibility.
 
     Returns:
@@ -455,15 +322,20 @@ def prepare_data(
         random.seed(seed)
         np.random.seed(seed)
 
-    def split(G, frac=frac):
+    def split(G, frac=test_frac):
         # load edges as sorted tuples for efficiency
         edges = {tuple(sorted(e)) for e in G.edges()}
         mst = {tuple(sorted(e))
-               for e in nx.maximum_spanning_tree(G, weight='DEP')}
+               for e in nx.maximum_spanning_tree(G, weight=weight if weight else None)}
+
+        removable_edges = list(edges - mst)
+        test_num = int(len(edges) * frac)
+        if len(removable_edges) < test_num:
+            print(
+                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {removable_edges} available.)')
 
         # fast set difference
-        removable_edges = list(edges - mst)
-        test_count = min(int(len(edges) * frac), len(removable_edges))
+        test_count = min(test_num, len(removable_edges))
         test_edges = random.sample(removable_edges, test_count)
         train_edges = list(edges - set(test_edges))
 
@@ -487,10 +359,7 @@ def prepare_data(
                     f'Value "{weight}" not recognized when agg=False. Falling back to unweighted.')
                 G_train.add_edges_from(train_edges)
         else:
-            if weight == 'num_occ':
-                G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['num_occ']) for u, v in train_edges])
-            elif weight == 'cov':
+            if weight == 'cov':
                 G_train.add_weighted_edges_from(
                     [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
             elif weight == 'dep':
@@ -502,19 +371,14 @@ def prepare_data(
                     f'Value "{weight}" not recognized when agg=True. Falling back to unweighted.')
                 G_train.add_edges_from(train_edges)
 
+        # sampling
         if controlled:
-            if agg:
-                test_non_edges = sample_non_edges_agg_stratified(
-                    G, len(test_edges))
-                train_non_edges = sample_non_edges_agg_stratified(
-                    G, len(train_edges))
-            else:
-                distrs, _ = distribution_finder(G)
-                dist_bins = distrs[0]
-                test_non_edges = sample_non_edges_dist_controlled(
-                    G, dist_bins, len(test_edges))
-                train_non_edges = sample_non_edges_dist_controlled(
-                    G, dist_bins, len(train_edges))
+            dist_bins, _ = distribution_finder(
+                G, dist_type=dist_type, n_bins=n_bins)
+            test_non_edges = dist_controlled_sampler(
+                G, dist_bins, len(test_edges))
+            train_non_edges = dist_controlled_sampler(
+                G, dist_bins, len(train_edges))
         else:
             # function to sample non-edges randomly
             def sample_non_edges(G, count):
@@ -533,17 +397,11 @@ def prepare_data(
 
         return G_train, test_edges, test_non_edges, train_non_edges
 
-    if agg:
-        import pickle
-        with open(fpath, 'rb') as f:
-            G = pickle.load(f)
-    else:
-        G = load(fpath, compress=compress)
-
-    # failsafe
+    # load in graph
+    G = load(fpath, compress=compress)
     if G.number_of_nodes() == 0:
-        print(f"Error: Graph loaded from {fpath} is entirely empty. Skipping.")
-        return None
+        raise SystemExit(
+            f"Error: Graph loaded from {fpath} is entirely empty.")
 
     # extracting lcc in case disconnected
     largest_cc = max(nx.connected_components(G), key=len)
@@ -552,8 +410,7 @@ def prepare_data(
     G_train, test_edges, test_non_edges, train_non_edges = split(G)
 
     if nx.is_empty(G_train):
-        print("Error: Empty training graph.")
-        return None
+        raise SystemExit("Error: Empty training graph.")
 
     # saving training graph
     with open(trainfile, 'w') as f:
@@ -789,35 +646,36 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
-        lat_u = np.nan_to_num(np.array(
-            [G.nodes[u].get('latitude') for u in U], dtype=np.float64), nan=0.0)
-        lng_u = np.nan_to_num(np.array(
-            [G.nodes[u].get('longitude') for u in U], dtype=np.float64), nan=0.0)
-        lat_v = np.nan_to_num(np.array(
-            [G.nodes[v].get('latitude') for v in V], dtype=np.float64), nan=0.0)
-        lng_v = np.nan_to_num(np.array(
-            [G.nodes[v].get('longitude') for v in V], dtype=np.float64), nan=0.0)
+        if not agg:
+            # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
+            lat_u = np.nan_to_num(np.array(
+                [G.nodes[u].get('latitude') for u in U], dtype=np.float64), nan=0.0)
+            lng_u = np.nan_to_num(np.array(
+                [G.nodes[u].get('longitude') for u in U], dtype=np.float64), nan=0.0)
+            lat_v = np.nan_to_num(np.array(
+                [G.nodes[v].get('latitude') for v in V], dtype=np.float64), nan=0.0)
+            lng_v = np.nan_to_num(np.array(
+                [G.nodes[v].get('longitude') for v in V], dtype=np.float64), nan=0.0)
 
-        # convert all coordinates to radians at once
-        lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
-        lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
+            # convert all coordinates to radians at once
+            lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
+            lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
 
-        # calculate haversine on the 1D arrays
-        dlat = lat_v_rad - lat_u_rad
-        dlng = lng_v_rad - lng_u_rad
-        a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
-            np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
+            # calculate haversine on the 1D arrays
+            dlat = lat_v_rad - lat_u_rad
+            dlng = lng_v_rad - lng_u_rad
+            a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
+                np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
 
-        # clip 'a' to [0, 1] to prevent NaN errors in sqrt from floating-point precision limits
-        a = np.clip(a, 0.0, 1.0)
+            # clip 'a' to [0, 1] to prevent NaN errors in sqrt from floating-point precision limits
+            a = np.clip(a, 0.0, 1.0)
 
-        dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-        # log scale and reshape to (N, 1) column vector
-        geo_feat = np.log1p(dist_km).reshape(-1, 1)
-        feature_blocks.append(geo_feat)
-        feature_names.append('log_dist_km')
+            # log scale and reshape to (n_pairs, 1) column vector
+            geo_feat = np.log1p(dist_km).reshape(-1, 1)
+            feature_blocks.append(geo_feat)
+            feature_names.append('log_dist_km')
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
@@ -889,47 +747,29 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         PecanPy walk mode. Default 'PreComp'.
     operator : str
         Binary operator for embeddings. Default 'hadamard'.
-    **kwargs
+    **kwargs :
         Hyperparameter settings forwarded to PecanPy / Word2Vec. Also allows for seed.
-        strength : float in (0, 1), optional
+        strength : bool, optional
             If set, additionally trains a second "strength" classifier over
             positive edges only: strong (DEP above the given quantile) vs weak.
             0.5 gives a median split. The threshold is fit on train positives.
             Reuses the same features/embeddings as the link task. Default None.
         strength_dist_control : bool, optional
-            Only meaningful with `strength`. Distance-matches the strong/weak
+            Only meaningful with strength=True. Distance-matches the strong/weak
             classes by binning positive edges by geographic distance and keeping
             min(#strong, #weak) per bin, so distance carries no marginal signal
-            about strength. Default False. If a class empties out after matching,
-            strength_auc is nan.
+            about strength. If a class empties out after matching,
+            strength_auc is nan. Default False.
         diagnostics : bool, optional
             If True, additionally returns a dict for building a regression
             table + error analysis: fitted model(s), feature names, test
             labels/predicted probabilities, and per-test-edge geographic
-            distance (km). Default False, leaving the return signature
-            otherwise unchanged. Keys: 'feature_names', 'link' (always), and
+            distance (km). Keys: 'feature_names', 'link' (always), and
             'strength' (only when `strength` is set) — each of the latter two
-            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges', 'bootstrap'}
+            maps to {'model', 'y_test', 'probs', 'dist_km', 'edges'}
             (edges are the (u, v) node-id pairs aligned with y_test/probs/dist_km,
-            for downstream analyses keyed on node attributes like category;
-            'bootstrap' is None unless `bootstrap_ci` is also set).
-        bootstrap_ci : bool, optional
-            If True (and `diagnostics=True`), also bootstraps a 95% CI for each
-            head's coefficients by refitting on `n_bootstrap` resamples (with
-            replacement) of the already-built, already-standardized training
-            matrix — cheap relative to the original fit since embeddings are
-            precomputed and baked into the columns, so only the logistic
-            regression itself is repeated. Uses the original (whole-sample)
-            standardization rather than re-fitting it per resample, which is a
-            standard simplification at this scale (the mean/std are effectively
-            converged at millions of rows). Default False.d
-        n_bootstrap : int, optional
-            Number of bootstrap resamples when `bootstrap_ci=True`. Default 50.
-        bootstrap_subsample : int, optional
-            If set, each bootstrap resample draws this many rows (with
-            replacement) instead of the full training-set size — trades CI
-            fidelity for speed on very large training matrices. Default None
-            (resample at the full training-set size).
+            for downstream analyses keyed on node attributes like category). 
+            Default False.
 
     Returns
     -------
@@ -963,9 +803,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
     diagnostics = kwargs.get('diagnostics', False)
-    bootstrap_ci = kwargs.get('bootstrap_ci', False)
-    n_bootstrap = kwargs.get('n_bootstrap', 50)
-    bootstrap_subsample = kwargs.get('bootstrap_subsample', None)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1045,7 +882,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 continue
         else:
             raise RuntimeError(
-                f"Pecanpy walk generation failed for all modes"
+                f"Pecanpy walk generation failed for all modes."
             ) from last_exception
 
         # convert to EmbeddingMap object
@@ -1055,17 +892,16 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Assemble feature matrices =====
 
-    # convert to list and sort for consisten indexing
+    # convert to list and sort for consistent indexing
     train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
-
-    # TODO: remove and rework
-    if ('cbg' in features or 'tract' in features) and not agg:
-        node_to_area(G)
 
     if 'comm' in features:
         node_to_comm(G)
 
     if not agg:
+        # TODO: remove and rework if using POI-level again
+        if ('cbg' in features or 'tract' in features):
+            node_to_area(G)
         if 'time' in features or 'income' in features:
             add_outside_metadata(G)
 
@@ -1080,7 +916,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.zeros(len(X_train_neg))
     ])
 
-    # remove to save memory if no longer needed
+    # remove originals to save memory if no longer needed
     if not strength:
         del X_train_pos, X_train_neg
     else:
@@ -1094,31 +930,12 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # accumulated in float64 for numerical stability, then cast back
     train_mean = X_train.mean(axis=0, dtype=np.float64).astype(np.float32)
     train_std = X_train.std(axis=0, dtype=np.float64).astype(np.float32)
-    train_std[train_std == 0] = 1.0  # arbitrary stand-in to avoid div by 0
+    train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
     X_train -= train_mean
     X_train /= train_std
 
     model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
-
-    # ===== bootstrap CI for coefficients (optional) =====
-    boot_ci = None
-    if diagnostics and bootstrap_ci:
-        n_samples = X_train.shape[0]
-        sub_n = bootstrap_subsample or n_samples
-        boot_coefs = np.empty(
-            (n_bootstrap, X_train.shape[1]), dtype=np.float64)
-        for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (link)', leave=False):
-            idx = np.random.randint(0, n_samples, size=sub_n)
-            bm = LogisticRegression(max_iter=1000)
-            bm.fit(X_train[idx], y_train[idx])
-            boot_coefs[b] = bm.coef_.ravel()
-        boot_ci = {
-            'ci_lower': np.percentile(boot_coefs, 2.5, axis=0),
-            'ci_upper': np.percentile(boot_coefs, 97.5, axis=0),
-            'n_bootstrap': n_bootstrap,
-            'subsample_n': sub_n,
-        }
 
     # ===== Test =====
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
@@ -1159,7 +976,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'probs': probs,
                 'dist_km': test_dist_km,
                 'edges': test_pos_kept_edges + test_neg_kept_edges,
-                'bootstrap': boot_ci,
             },
         }
 
@@ -1248,24 +1064,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         print(f"[{feature_label}{op_label}]"
               f"  strength AUC = {strength_auc:.4f}")
 
-        str_boot_ci = None
-        if diagnostics and bootstrap_ci:
-            n_samples_s = X_train_pos.shape[0]
-            sub_n_s = bootstrap_subsample or n_samples_s
-            boot_coefs_s = np.empty(
-                (n_bootstrap, X_train_pos.shape[1]), dtype=np.float64)
-            for b in tqdm(range(n_bootstrap), desc='Bootstrapping CI (strength)', leave=False):
-                idx = np.random.randint(0, n_samples_s, size=sub_n_s)
-                bm = LogisticRegression(max_iter=1000, class_weight='balanced')
-                bm.fit(X_train_pos[idx], y_str_train[idx])
-                boot_coefs_s[b] = bm.coef_.ravel()
-            str_boot_ci = {
-                'ci_lower': np.percentile(boot_coefs_s, 2.5, axis=0),
-                'ci_upper': np.percentile(boot_coefs_s, 97.5, axis=0),
-                'n_bootstrap': n_bootstrap,
-                'subsample_n': sub_n_s,
-            }
-
         if diagnostics:
             if strength_dist_control:
                 str_test_edges = [test_edges[keep_test_pos[i]] for i in idx_te]
@@ -1278,7 +1076,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'dist_km': edge_distances_km(G, str_test_edges) if G is not None
                 else np.full(len(y_str_test), np.nan),
                 'edges': str_test_edges,
-                'bootstrap': str_boot_ci,
             }
             return auc, embedding_map, strength_auc, diag
 
