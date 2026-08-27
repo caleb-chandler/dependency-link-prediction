@@ -501,8 +501,22 @@ def add_outside_metadata(G):
                                                           ['1', '2', '3', '4']].values
 
 
+def haversine(lat_u, lng_u, lat_v, lng_v):
+    # convert coordinates to radians
+    lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
+    lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
+    # calculate haversine on the 1D arrays
+    dlat = lat_v_rad - lat_u_rad
+    dlng = lng_v_rad - lng_u_rad
+    a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
+        np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
+    # clip 'a' to [0, 1] to prevent NaN errors in sqrt from floating-point precision limits
+    a = np.clip(a, 0.0, 1.0)
+    return 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+
 def edge_distances_km(G, edges):
-    """Haversine distance (km) between endpoints of each (u, v) edge in `edges`."""
+    """Haversine distance between endpoints of each (u, v) edge in `edges`. For use in strength task."""
     if not edges:
         return np.array([], dtype=np.float64)
     lat_u = np.radians(np.array(
@@ -647,7 +661,7 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        if 'latitude' in G:
+        if any(nx.get_node_attributes(G, 'latitude')):
             # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
             lat_u = np.nan_to_num(np.array(
                 [G.nodes[u].get('latitude') for u in U], dtype=np.float32))
@@ -658,35 +672,19 @@ def build_feature_matrix(
             lng_v = np.nan_to_num(np.array(
                 [G.nodes[v].get('longitude') for v in V], dtype=np.float32))
 
-            # convert all coordinates to radians at once
-            lat_u_rad, lng_u_rad = np.radians(lat_u), np.radians(lng_u)
-            lat_v_rad, lng_v_rad = np.radians(lat_v), np.radians(lng_v)
-
-            # calculate haversine on the 1D arrays
-            dlat = lat_v_rad - lat_u_rad
-            dlng = lng_v_rad - lng_u_rad
-            a = np.sin(dlat / 2.0)**2 + np.cos(lat_u_rad) * \
-                np.cos(lat_v_rad) * np.sin(dlng / 2.0)**2
-
-            # clip 'a' to [0, 1] to prevent NaN errors in sqrt from floating-point precision limits
-            a = np.clip(a, 0.0, 1.0)
-
-            dist_km = 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            # apply haversine function
+            dist_km = haversine(lat_u, lng_u, lat_v, lng_v)
 
             # log scale and reshape to (n_pairs, 1) column vector
             dist_feat = np.log1p(dist_km).reshape(-1, 1)
             feature_blocks.append(dist_feat)
             feature_names.append('log_dist_km')
-        elif 'COORDS_ARR' in G:
-            ''' 
-            point is to get a column of mean distances for all pairs as dist_feat
 
-            so i think i might need to get an array of lat/lon for each node first (could be from G itself)
-            and then create a new array holding distances of all possible combinations of lat/lon pairs
+        elif any(nx.get_node_attributes(G, 'COORDS_ARR')):
+            # make sure array exists for every node
+            assert all(data.get('COORDS_ARR')
+                       for _, data in G.nodes(data=True))
 
-            i would then stack it vertically with a column for each pair, then do np.mean or whatever else to
-            convert it to a single row, then turn the row into a column that becomes dist_feat
-            '''
             all_comb_u = []
             all_comb_v = []
             pair_indices = []
@@ -708,16 +706,39 @@ def build_feature_matrix(
                 # this results in the first array repeating elements once for each element in the second array,
                 # creating two (N, 2) arrays with all combinations by index (N = rows in latlons_u X rows in latlons_v)
                 all_comb_u.append(latlons_u[grid_u.ravel()])
-                all_comb_v.append([grid_v.ravel()])
+                all_comb_v.append(latlons_v[grid_v.ravel()])
 
                 # record how many combinations this pair generated as a 1d array matching the length of the all_comb arrays
                 num_comb = grid_u.size
                 pair_indices.append(np.full(num_comb, i))
 
-            # convert to supertall 2-col arrays indexed by pair_indices
+            # convert to supertall 2-col arrays and concat pair_indices
             all_comb_u = np.vstack(all_comb_u)
             all_comb_v = np.vstack(all_comb_v)
             pair_indices = np.concatenate(pair_indices)
+
+            # assign lats and lons with slice notation
+            lat_u = all_comb_u[:, 0]
+            lng_u = all_comb_u[:, 1]
+            lat_v = all_comb_v[:, 0]
+            lng_v = all_comb_v[:, 1]
+
+            # apply haversine function and index distances with pair_indices
+            # also convert to df and add titles
+            poi_dist_col = haversine(lat_u, lng_u, lat_v, lng_v)
+            all_comb_distances = pd.DataFrame(np.column_stack(
+                (pair_indices, poi_dist_col)), columns=['pair_idx', 'dist'])
+
+            # group by index and take the mean
+            mean_dist_km = all_comb_distances.groupby('pair_idx')[
+                'dist'].mean()
+
+            # log-compress and convert back to array
+            dist_feat = np.log1p(mean_dist_km.values).reshape(-1, 1)
+
+            # add to features
+            feature_blocks.append(dist_feat)
+            feature_names.append('log_dist_km')
 
     if 'comm' in features:
         comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
