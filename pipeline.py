@@ -879,7 +879,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             f"include {[f for f in features if f != 'emb']}"
         )
 
-    # converting training graph to nx.Graph object
+    # convert training graph to nx.Graph object
     G_train = nx.read_edgelist(
         trainfile, data=[('weight', float)], delimiter='\t')
 
@@ -969,6 +969,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.zeros(len(X_train_neg))
     ])
 
+    # convert Xs to df for feature names and standardization gates
+    X_train = pd.DataFrame(X_train, columns=feature_names)
+
     # remove originals to save memory if no longer needed
     if not strength:
         del X_train_pos, X_train_neg
@@ -985,10 +988,10 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         Bypasses StandardScaler float64 upcasting by z-scoring in place. 
         Stats are accumulated in float64 for numerical stability, then cast back.
         '''
-        # mask for dummmy variables to bypass standardization
-        is_dummy = train_set.apply(lambda col: set(
-            col.dropna().unique()).issubset({0.0, 1.0, 0, 1}))
-        standardizable = train_set.columns[~is_dummy]
+        # exclude dummy variables and embeddings from standardization
+        # (mask if vals fall only in 0-1 range)
+        to_bypass = (train_set.min() >= 0) & (train_set.max() <= 1)
+        standardizable = train_set.columns[~to_bypass]
 
         train_mean = train_set[standardizable].mean(
             axis=0, dtype=np.float64).astype(np.float32)
@@ -1003,10 +1006,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     X_train, train_mean, train_std = standardize(X_train)
 
-    # add constant, fit model, and print out description
+    # add constant and fit model
     sm.add_constant(X_train)
     link_model = sm.Logit(y_train, X_train).fit()
-    print(link_model.summary())
+
+    # print out description excluding embeddings
+    if 'emb' in features:
+        coef_table = pd.read_html(
+            link_model.summary2().tables[1].as_html(), header=0, index_col=0)[0]
+        emb_features = [
+            name for name in feature_names if name.startswith('emb_')]
+        filt_summary = coef_table.drop(index=emb_features)
+        print(filt_summary)
+    else:
+        print(link_model.summary2())
 
     # ===== Test =====
 
@@ -1031,7 +1044,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # --- report ---
     feature_label = '+'.join(features)
     op_label = f" ({operator})" if 'emb' in features else ""
-    print(f"[{feature_label}{op_label}]  AUC = {link_auc:.4f}")
+    print(f"[{feature_label}{op_label}]  Link AUC = {link_auc:.4f}")
 
     # ===== strength head =====
     if strength:
@@ -1095,16 +1108,26 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 return (link_auc, link_model, embedding_map, float('nan'), None)
 
         # same float32 in-place standardization as before
+        X_train_pos = pd.DataFrame(X_train_pos, columns=feature_names)
         X_train_pos, str_mean, str_std = standardize(X_train_pos)
         X_test_pos -= str_mean
         X_test_pos /= str_std
 
         str_model = sm.Logit(y_str_train, X_train_pos).fit()
+
+        if 'emb' in features:
+            coef_table = pd.read_html(
+                str_model.summary2().tables[1].as_html(), header=0, index_col=0)[0]
+            filt_summary = coef_table.drop(index=emb_features)
+            print(filt_summary)
+        else:
+            print(str_model.summary2())
+
         str_probs = str_model.predict(X_test_pos)
         str_auc = roc_auc_score(y_str_test, str_probs)
 
         print(f"[{feature_label}{op_label}]"
-              f"  strength AUC = {str_auc:.4f}")
+              f"  Strength AUC = {str_auc:.4f}")
 
         return link_auc, link_model, embedding_map, str_auc, str_model
 
