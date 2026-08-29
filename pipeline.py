@@ -3,15 +3,13 @@ import numpy as np
 import pandas as pd
 from pecanpy import pecanpy as n2v
 import random
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import confusion_matrix, roc_auc_score
 from tqdm.auto import tqdm
 import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
 import statsmodels.api as sm
-
 
 # ===================================================================
 # EMBEDDING STORE
@@ -1007,7 +1005,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     X_train, train_mean, train_std = standardize(X_train)
 
     # add constant and fit model
-    sm.add_constant(X_train)
+    X_train = sm.add_constant(X_train)
     link_model = sm.Logit(y_train, X_train).fit()
 
     # print out description excluding embeddings
@@ -1038,8 +1036,12 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     X_test -= train_mean
     X_test /= train_std
 
-    probs = link_model.predict(X_test)
-    link_auc = roc_auc_score(y_test, probs)
+    link_probs = link_model.predict(X_test)
+    link_preds = (link_probs >= 0.5).astype(int)
+    link_auc = roc_auc_score(y_test, link_probs)
+
+    # create confusion matrix "in-house"
+    link_cm = confusion_matrix(y_test, link_preds)
 
     # --- report ---
     feature_label = '+'.join(features)
@@ -1113,6 +1115,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         X_test_pos -= str_mean
         X_test_pos /= str_std
 
+        X_train_pos = sm.add_constant(X_train_pos)
         str_model = sm.Logit(y_str_train, X_train_pos).fit()
 
         if 'emb' in features:
@@ -1124,11 +1127,22 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             print(str_model.summary2())
 
         str_probs = str_model.predict(X_test_pos)
+        str_preds = (str_probs >= 0.5).astype(int)
         str_auc = roc_auc_score(y_str_test, str_probs)
+        str_cm = confusion_matrix(y_str_test, str_preds)
 
         print(f"[{feature_label}{op_label}]"
               f"  Strength AUC = {str_auc:.4f}")
 
-        return link_auc, link_model, embedding_map, str_auc, str_model
+        return {'link_auc': link_auc,
+                'link_model': link_model,
+                'link_cm': link_cm,
+                'embedding_map': embedding_map,
+                'str_auc': str_auc,
+                'str_model': str_model,
+                'str_cm': str_cm}
 
-    return link_auc, link_model, embedding_map
+    return {'link_auc': link_auc,
+            'link_cm': link_cm,
+            'link_preds': link_preds,
+            'embedding_map': embedding_map}
