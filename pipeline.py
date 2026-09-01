@@ -70,6 +70,7 @@ class EmbeddingMap:
 
 
 def load(fpath, compress=False):
+    fpath = str(fpath)
     if fpath.endswith('.pkl'):
         with open(fpath, 'rb') as f:
             df = pickle.load(f)
@@ -197,10 +198,24 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
     n = len(nodes)
     node_to_idx = {nd: i for i, nd in enumerate(nodes)}
 
-    lat = np.array([_coord(G.nodes[nd], 'latitude')
-                   for nd in nodes], dtype=np.float64)
-    lng = np.array([_coord(G.nodes[nd], 'longitude')
-                   for nd in nodes], dtype=np.float64)
+    # agg nodes (tract+category buckets) carry a COORDS_ARR of member-POI
+    # lat/lons instead of a single latitude/longitude; use the bucket
+    # centroid as a representative point for candidate-distance binning
+    # (the target distribution itself, DIST_KM_MEAN, is the exact
+    # full-pairwise mean -- centroid distance is an approximation used
+    # only to steer sampling toward the right bin, not a modeled feature)
+    if not nx.get_node_attributes(G, 'latitude') and nx.get_node_attributes(G, 'COORDS_ARR'):
+        lat = np.array([np.mean(G.nodes[nd]['COORDS_ARR'][:, 0])
+                        if G.nodes[nd].get('COORDS_ARR') is not None and len(G.nodes[nd]['COORDS_ARR']) else 0.0
+                        for nd in nodes], dtype=np.float64)
+        lng = np.array([np.mean(G.nodes[nd]['COORDS_ARR'][:, 1])
+                        if G.nodes[nd].get('COORDS_ARR') is not None and len(G.nodes[nd]['COORDS_ARR']) else 0.0
+                        for nd in nodes], dtype=np.float64)
+    else:
+        lat = np.array([_coord(G.nodes[nd], 'latitude')
+                       for nd in nodes], dtype=np.float64)
+        lng = np.array([_coord(G.nodes[nd], 'longitude')
+                       for nd in nodes], dtype=np.float64)
 
     # make sure you're not sampling existing edges
     # integer-keyed edge set for faster hashing than string tuples
@@ -538,6 +553,11 @@ def edge_distances_km(G, edges):
     """Haversine distance between endpoints of each (u, v) edge in `edges`. For use in strength task."""
     if not edges:
         return np.array([], dtype=np.float64)
+    if not nx.get_node_attributes(G, 'latitude'):
+        # agg nodes have no single lat/lon (COORDS_ARR instead); these are
+        # real graph edges, so use the exact precomputed edge distance
+        dist_attr = 'DIST_KM_MEAN' if nx.get_edge_attributes(G, 'DIST_KM_MEAN') else 'DIST_KM'
+        return np.array([G[u][v].get(dist_attr, 0.0) for u, v in edges], dtype=np.float64)
     lat_u = np.radians(np.array(
         [G.nodes[u].get('latitude') or 0.0 for u, _ in edges], dtype=np.float64))
     lng_u = np.radians(np.array(
@@ -700,56 +720,43 @@ def build_feature_matrix(
             feature_names.append('log_dist_km')
 
         elif nx.get_node_attributes(G, 'COORDS_ARR'):
-            all_comb_u = []
-            all_comb_v = []
-            pair_indices = []
+            # cache each node's coordinate array once -- nodes repeat across
+            # many edges (avg ~690x on the full agg network), so this avoids
+            # re-doing nan_to_num/astype on every occurrence
+            coords_cache = {}
 
-            # go back to valid_edges since we're looping
+            def _coords(n):
+                arr = coords_cache.get(n)
+                if arr is None:
+                    arr = np.nan_to_num(
+                        G.nodes[n].get('COORDS_ARR')).astype(np.float32)
+                    coords_cache[n] = arr
+                return arr
+
+            # per-edge mean over the full POI x POI cartesian product between
+            # endpoints, looped edge-by-edge rather than stacking every
+            # combination from every edge into one array first -- doing the
+            # latter on this network tries to allocate a >1e9-row array and
+            # raises MemoryError. This keeps the exact same statistic
+            # (matches how DIST_KM_MEAN itself is defined) with peak memory
+            # bounded by the single largest bucket-pair's combination count.
+            dist_km_means = np.empty(len(valid_edges), dtype=np.float32)
             for i, (u, v) in enumerate(valid_edges):
-                latlons_u = np.nan_to_num(G.nodes[u].get(
-                    'COORDS_ARR')).astype(np.float32)
-                latlons_v = np.nan_to_num(G.nodes[v].get(
-                    'COORDS_ARR')).astype(np.float32)
+                latlons_u = _coords(u)
+                latlons_v = _coords(v)
 
-                # np.arange creates an array of indices for each row
-                # np.meshgrid then creates an array with each possible combination represented element-wise
                 grid_u, grid_v = np.meshgrid(
                     np.arange(latlons_u.shape[0]), np.arange(latlons_v.shape[0]), indexing='ij'
                 )
+                lat_u = latlons_u[grid_u.ravel(), 0]
+                lng_u = latlons_u[grid_u.ravel(), 1]
+                lat_v = latlons_v[grid_v.ravel(), 0]
+                lng_v = latlons_v[grid_v.ravel(), 1]
 
-                # ravel flattens the matrices (still matched element-wise), and indexes the arrays with them
-                # this results in the first array repeating elements once for each element in the second array,
-                # creating two (N, 2) arrays with all combinations by index (N = rows in latlons_u X rows in latlons_v)
-                all_comb_u.append(latlons_u[grid_u.ravel()])
-                all_comb_v.append(latlons_v[grid_v.ravel()])
+                dist_km_means[i] = haversine(lat_u, lng_u, lat_v, lng_v).mean()
 
-                # record how many combinations this pair generated as a 1d array matching the length of the all_comb arrays
-                num_comb = grid_u.size
-                pair_indices.append(np.full(num_comb, i))
-
-            # convert to supertall 2-col arrays and concat pair_indices
-            all_comb_u = np.vstack(all_comb_u)
-            all_comb_v = np.vstack(all_comb_v)
-            pair_indices = np.concatenate(pair_indices)
-
-            # assign lats and lons with slice notation
-            lat_u = all_comb_u[:, 0]
-            lng_u = all_comb_u[:, 1]
-            lat_v = all_comb_v[:, 0]
-            lng_v = all_comb_v[:, 1]
-
-            # apply haversine function and index distances with pair_indices
-            # also convert to df and add titles
-            poi_dist_col = haversine(lat_u, lng_u, lat_v, lng_v)
-            all_comb_distances = pd.DataFrame(np.column_stack(
-                (pair_indices, poi_dist_col)), columns=['pair_idx', 'dist'])
-
-            # group by index and take the mean
-            mean_dist_km = all_comb_distances.groupby('pair_idx')[
-                'dist'].mean()
-
-            # log-compress and convert back to array
-            dist_feat = np.log1p(mean_dist_km.values).reshape(-1, 1)
+            # log-compress
+            dist_feat = np.log1p(dist_km_means).reshape(-1, 1)
 
             # add to features
             feature_blocks.append(dist_feat)
@@ -876,7 +883,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     if agg and G:
         if any(nx.get_node_attributes(G, 'COORDS_ARR')):
             # make sure array exists for every node
-            assert all(data.get('COORDS_ARR')
+            assert all(data.get('COORDS_ARR') is not None
                        for _, data in G.nodes(data=True))
 
     # seed
@@ -1006,8 +1013,20 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # ===== Train =====
 
     # add constant and fit model
+    # check_rank=False: Logit's default rank check runs a full QR decomposition
+    # of the whole exog matrix as a float64 copy before fitting even starts --
+    # at this network's scale that's an 11+ GiB allocation on top of X_train
+    # already in memory, which is what was actually behind both the MemoryError
+    # and the multi-hour stalls seen earlier (the QR call runs regardless of
+    # solver). Skipping it doesn't change the fit, only a pre-flight
+    # collinearity diagnostic.
+    # method='lbfgs': default Newton-Raphson recomputes the full p x p Hessian
+    # over every row each iteration (O(n*p^2)); at this network's scale
+    # (millions of rows) that's much more expensive than L-BFGS's gradient-only
+    # (O(n*p)) iterations. Same MLE either way.
     X_train = sm.add_constant(X_train)
-    link_model = sm.Logit(y_train, X_train).fit()
+    link_model = sm.Logit(y_train, X_train, check_rank=False).fit(
+        method='lbfgs', maxiter=200)
 
     # print out description excluding embeddings
     if 'emb' in features:
@@ -1145,7 +1164,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             X_test_pos /= str_std
 
         X_train_pos = sm.add_constant(X_train_pos)
-        str_model = sm.Logit(y_str_train, X_train_pos).fit()
+        str_model = sm.Logit(y_str_train, X_train_pos, check_rank=False).fit(
+            method='lbfgs', maxiter=200)
 
         if 'emb' in features:
             coef_table = pd.read_html(
