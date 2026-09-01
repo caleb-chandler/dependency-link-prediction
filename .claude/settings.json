@@ -30,7 +30,9 @@
       "Bash(\"C:\\\\Users\\\\User\\\\anaconda3\\\\envs\\\\depnet\\\\python.exe\" \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\8b49005d-5d52-4132-9299-0a15998ed7b0\\\\scratchpad\\\\diag_split.py\")",
       "Bash(python3 -c ' *)",
       "Bash(git ls-tree *)",
-      "Bash(grep -o \"undir_dep[a-zA-Z0-9_/.]*\\\\|DEP_NET_GEOTAX[a-zA-Z0-9_/.]*\\\\|fpath = [^\\\\\\\\\\\\\\\\]*\")"
+      "Bash(grep -o \"undir_dep[a-zA-Z0-9_/.]*\\\\|DEP_NET_GEOTAX[a-zA-Z0-9_/.]*\\\\|fpath = [^\\\\\\\\\\\\\\\\]*\")",
+      "Bash(python3 -)",
+      "Read(//c/Users/User/anaconda3/Lib/site-packages/pandas/core/groupby/**)"
     ]
   }
 }

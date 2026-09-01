@@ -10,6 +10,7 @@ from shapely.geometry import Point
 from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
 import statsmodels.api as sm
+import pickle
 
 # ===================================================================
 # EMBEDDING STORE
@@ -69,24 +70,27 @@ class EmbeddingMap:
 
 
 def load(fpath, compress=False):
-    # downcast for better performance
-    _dtypes = {
-        'NODE_A': 'category', 'NODE_B': 'category',
-        'N_COVISITS': 'float32', 'DIST_KM_MIN': 'float32',
-        'DIST_KM_MEAN': 'float32', 'N_UIDS_A': 'float32',
-        'N_POIS_A': 'float32', 'N_VISITS_A': 'float32',
-        'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
-        'N_VISITS_B': 'float32', 'DEP': 'float32'
-    }
-    df = pd.read_csv(fpath, dtype=_dtypes)
+    if fpath.endswith('.pkl'):
+        with open(fpath, 'rb') as f:
+            df = pickle.load(f)
+
+    elif 'csv' in fpath:  # checks for both .csv and .csv.gz
+        # downcast for better performance
+        _dtypes = {
+            'NODE_A': 'category', 'NODE_B': 'category',
+            'N_COVISITS': 'float32', 'DIST_KM_MIN': 'float32',
+            'DIST_KM_MEAN': 'float32', 'N_UIDS_A': 'float32',
+            'N_POIS_A': 'float32', 'N_VISITS_A': 'float32',
+            'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
+            'N_VISITS_B': 'float32', 'DEP': 'float32'
+        }
+        df = pd.read_csv(fpath, dtype=_dtypes)
 
     # optional log-compression
     if compress:
-        scale_factor = 1.0 / np.median(df['DEP'])
-        df['DEP'] = df['DEP'].apply(lambda x: np.log1p(x * scale_factor))
-        scale_factor = 1.0 / np.median(df['N_COVISITS'])
-        df['N_COVISITS'] = df['N_COVISITS'].apply(
-            lambda x: np.log1p(x * scale_factor))
+        for col in ['DEP', 'N_COVISITS']:
+            scale_factor = 1.0 / np.median(df[col])
+            df[col] = np.log1p(df[col] * scale_factor)
 
     G = nx.from_pandas_edgelist(
         df,
@@ -96,18 +100,28 @@ def load(fpath, compress=False):
                    'DIST_KM_MEAN', 'N_COVISITS', 'DEP'],
     )
 
-    # assign node attrs
-    def node_attr(a_col, b_col):
-        return pd.concat([
-            df.set_index('NODE_A')[a_col],
-            df.set_index('NODE_B')[b_col],
-        ]).groupby(level=0).first().to_dict()
+    # --- bulk assign node attrs ---
 
-    # apply returned Series per attr
-    nx.set_node_attributes(G, node_attr('N_UIDS_A', 'N_UIDS_B'), 'N_UIDS')
-    nx.set_node_attributes(G, node_attr('N_POIS_A', 'N_POIS_B'), 'N_POIS')
-    nx.set_node_attributes(G, node_attr(
-        'N_VISITS_A', 'N_VISITS_B'), 'N_VISITS')
+    # source
+    cols_a = ['NODE_A', 'N_UIDS_A', 'N_POIS_A', 'NODE_A_COORDS', 'N_VISITS_A']
+    df_a = df[cols_a].rename(columns={
+        'NODE_A': 'node', 'N_UIDS_A': 'N_UIDS', 'N_POIS_A': 'N_POIS',
+        'NODE_A_COORDS': 'COORDS_ARR', 'N_VISITS_A': 'N_VISITS'
+    })
+
+    # target
+    cols_b = ['NODE_B', 'N_UIDS_B', 'N_POIS_B', 'NODE_B_COORDS', 'N_VISITS_B']
+    df_b = df[cols_b].rename(columns={
+        'NODE_B': 'node', 'N_UIDS_B': 'N_UIDS', 'N_POIS_B': 'N_POIS',
+        'NODE_B_COORDS': 'COORDS_ARR', 'N_VISITS_B': 'N_VISITS'
+    })
+
+    node_df = pd.concat([df_a, df_b], ignore_index=True)
+    node_df = node_df.drop_duplicates(
+        subset=['node'], keep='first').set_index('node')
+
+    node_attrs = node_df.to_dict(orient='index')
+    nx.set_node_attributes(G, node_attrs)
 
     print(f"Nodes: {G.number_of_nodes()}")
     print(f"Edges: {G.number_of_edges()}")
@@ -171,7 +185,7 @@ def distribution_finder(G, dist_type, n_bins):
     return distribution, element_set
 
 
-def dist_controlled_sampler(G, distr, total_count, batch_size=2_000_000):
+def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_000):
     def _coord(attrs, *keys):
         for k in keys:
             v = attrs.get(k)
@@ -188,12 +202,16 @@ def dist_controlled_sampler(G, distr, total_count, batch_size=2_000_000):
     lng = np.array([_coord(G.nodes[nd], 'longitude')
                    for nd in nodes], dtype=np.float64)
 
+    # make sure you're not sampling existing edges
     # integer-keyed edge set for faster hashing than string tuples
-    edge_set_int = set()
+    existing_edges_int = set()
     for u, v in G.edges():
         ui, vi = node_to_idx[u], node_to_idx[v]
-        # set so that lower idx is always first
-        edge_set_int.add((ui, vi) if ui < vi else (vi, ui))
+        existing_edges_int.add((ui, vi) if ui < vi else (vi, ui))
+    if avoid:
+        for u, v in avoid:
+            ui, vi = node_to_idx[u], node_to_idx[v]
+            existing_edges_int.add((ui, vi) if ui < vi else (vi, ui))
 
     bin_intervals = list(distr.index)
     n_bins = len(bin_intervals)
@@ -271,8 +289,8 @@ def dist_controlled_sampler(G, distr, total_count, batch_size=2_000_000):
                         break
                     u_i, v_i = int(ui[k]), int(vi[k])
                     edge_int = (u_i, v_i) if u_i < v_i else (v_i, u_i)
-                    if edge_int not in edge_set_int:
-                        edge_set_int.add(edge_int)
+                    if edge_int not in existing_edges_int:
+                        existing_edges_int.add(edge_int)
                         bin_results[b].append((nodes[u_i], nodes[v_i]))
                         bin_filled[b] += 1
                         added += 1
@@ -320,22 +338,25 @@ def prepare_data(
         random.seed(seed)
         np.random.seed(seed)
 
+    capweight = 'DEP' if weight == 'dep' else (
+        'N_COVISITS' if weight == 'cov' else None)
+
     def split(G, frac=test_frac):
         # load edges as sorted tuples for efficiency
         edges = {tuple(sorted(e)) for e in G.edges()}
         mst = {tuple(sorted(e))
-               for e in nx.maximum_spanning_tree(G, weight=weight if weight else None)}
+               for e in nx.maximum_spanning_tree(G, weight=capweight if weight else None)}
 
-        removable_edges = list(edges - mst)
+        removable_edges = sorted(edges - mst)
         test_num = int(len(edges) * frac)
         if len(removable_edges) < test_num:
             print(
-                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {removable_edges} available.)')
+                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(removable_edges)} available.)')
 
         # fast set difference
         test_count = min(test_num, len(removable_edges))
         test_edges = random.sample(removable_edges, test_count)
-        train_edges = list(edges - set(test_edges))
+        train_edges = sorted(edges - set(test_edges))
 
         # build training graph
         G_train = nx.Graph()
@@ -376,7 +397,7 @@ def prepare_data(
             test_non_edges = dist_controlled_sampler(
                 G, dist_bins, len(test_edges))
             train_non_edges = dist_controlled_sampler(
-                G, dist_bins, len(train_edges))
+                G, dist_bins, len(train_edges), avoid=test_non_edges)
         else:
             # function to sample non-edges randomly
             def sample_non_edges(G, count):
@@ -659,7 +680,7 @@ def build_feature_matrix(
 
     # vectorized geographic distance
     if 'dist' in features:
-        if any(nx.get_node_attributes(G, 'latitude')):
+        if nx.get_node_attributes(G, 'latitude'):
             # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
             lat_u = np.nan_to_num(np.array(
                 [G.nodes[u].get('latitude') for u in U], dtype=np.float32))
@@ -678,11 +699,7 @@ def build_feature_matrix(
             feature_blocks.append(dist_feat)
             feature_names.append('log_dist_km')
 
-        elif any(nx.get_node_attributes(G, 'COORDS_ARR')):
-            # make sure array exists for every node
-            assert all(data.get('COORDS_ARR')
-                       for _, data in G.nodes(data=True))
-
+        elif nx.get_node_attributes(G, 'COORDS_ARR'):
             all_comb_u = []
             all_comb_v = []
             pair_indices = []
@@ -854,6 +871,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
+    standardize = kwargs.get('standardize', False)
+
+    if agg and G:
+        if any(nx.get_node_attributes(G, 'COORDS_ARR')):
+            # make sure array exists for every node
+            assert all(data.get('COORDS_ARR')
+                       for _, data in G.nodes(data=True))
 
     # seed
     seed = kwargs.get('seed', None)
@@ -981,29 +1005,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Train =====
 
-    def standardize(train_set):
-        ''' 
-        Bypasses StandardScaler float64 upcasting by z-scoring in place. 
-        Stats are accumulated in float64 for numerical stability, then cast back.
-        '''
-        # exclude dummy variables and embeddings from standardization
-        # (mask if vals fall only in 0-1 range)
-        to_bypass = (train_set.min() >= 0) & (train_set.max() <= 1)
-        standardizable = train_set.columns[~to_bypass]
-
-        train_mean = train_set[standardizable].mean(
-            axis=0, dtype=np.float64).astype(np.float32)
-        train_std = train_set[standardizable].std(
-            axis=0, dtype=np.float64).astype(np.float32)
-
-        train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
-        train_set[standardizable] -= train_mean
-        train_set[standardizable] /= train_std
-
-        return train_set, train_mean, train_std
-
-    X_train, train_mean, train_std = standardize(X_train)
-
     # add constant and fit model
     X_train = sm.add_constant(X_train)
     link_model = sm.Logit(y_train, X_train).fit()
@@ -1032,9 +1033,33 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         np.zeros(len(X_test_neg))
     ])
 
-    # apply the training z-score to the test matrix in place (same reason as above)
-    X_test -= train_mean
-    X_test /= train_std
+    if standardize:
+        # TODO: if you're going to use this again you need to modify the function so
+        # that it fills binary cols with 0s instead of removing them
+        def standardizer(train_set):
+            ''' 
+            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+            Stats are accumulated in float64 for numerical stability, then cast back.
+            '''
+            # exclude dummy variables and embeddings from standardization
+            # (mask if vals fall only in 0-1 range)
+            to_bypass = (train_set.min() >= 0) & (train_set.max() <= 1)
+            standardizable = train_set.columns[~to_bypass]
+
+            train_mean = train_set[standardizable].mean(
+                axis=0, dtype=np.float64).astype(np.float32)
+            train_std = train_set[standardizable].std(
+                axis=0, dtype=np.float64).astype(np.float32)
+
+            train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
+            train_set[standardizable] -= train_mean
+            train_set[standardizable] /= train_std
+
+            return train_set, train_mean, train_std
+        X_train, train_mean, train_std = standardizer(X_train)
+        # apply the training z-score to the test matrix in place (same reason as above)
+        X_test -= train_mean
+        X_test /= train_std
 
     link_probs = link_model.predict(X_test)
     link_preds = (link_probs >= 0.5).astype(int)
@@ -1106,14 +1131,18 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                   f"test {len(idx_te)}/{len(dep_test)} edges kept")
             if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
                 print("Warning: a strength class vanished after distance "
-                      "matching — cannot score. Returning nan.")
-                return (link_auc, link_model, embedding_map, float('nan'), None)
+                      "matching — cannot score. Returning link results.")
+                return {'link_auc': link_auc,
+                        'link_model': link_model,
+                        'link_cm': link_cm,
+                        'embedding_map': embedding_map}
 
         # same float32 in-place standardization as before
         X_train_pos = pd.DataFrame(X_train_pos, columns=feature_names)
-        X_train_pos, str_mean, str_std = standardize(X_train_pos)
-        X_test_pos -= str_mean
-        X_test_pos /= str_std
+        if standardize:
+            X_train_pos, str_mean, str_std = standardizer(X_train_pos)
+            X_test_pos -= str_mean
+            X_test_pos /= str_std
 
         X_train_pos = sm.add_constant(X_train_pos)
         str_model = sm.Logit(y_str_train, X_train_pos).fit()
@@ -1143,6 +1172,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 'str_cm': str_cm}
 
     return {'link_auc': link_auc,
+            'link_model': link_model,
             'link_cm': link_cm,
-            'link_preds': link_preds,
             'embedding_map': embedding_map}
