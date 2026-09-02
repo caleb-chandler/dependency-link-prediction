@@ -1,0 +1,5 @@
+Combo,Converged,Iterations,Max |Embedding Coef|,Median |Embedding Coef|,Max Std.Err (embedding),Max |Odds Ratio| (exp of max coef),Link AUC
+Distance-Matched | Weighted,True,128,2.859,0.8702,0.0438,17.444,0.7267
+Distance-Matched | Unweighted,False,200,42.0639,9.012,0.9041,1.8540915325138778e+18,0.8152
+Unmatched | Weighted,True,82,3.1446,0.7858,0.0473,23.211,0.8564
+Unmatched | Unweighted,False,200,35.3645,8.9954,1.045,2283448393328423.5,0.9036

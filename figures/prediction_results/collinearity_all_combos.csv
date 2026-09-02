@@ -1,0 +1,5 @@
+Combo,raw_emb__max_abs_offdiag_corr,raw_emb__mean_abs_offdiag_corr,raw_emb__n_pairs_corr_gt_0.8,raw_emb__n_pairs_corr_gt_0.5,raw_emb__condition_number,raw_emb__max_VIF,raw_emb__n_dims_VIF_gt_10,raw_emb__n_dims_VIF_gt_5,hadamard_feat__max_abs_offdiag_corr,hadamard_feat__mean_abs_offdiag_corr,hadamard_feat__n_pairs_corr_gt_0.8,hadamard_feat__n_pairs_corr_gt_0.5,hadamard_feat__condition_number,hadamard_feat__max_VIF,hadamard_feat__n_dims_VIF_gt_10,hadamard_feat__n_dims_VIF_gt_5
+Distance-Matched | Weighted,0.7586,0.1741,0,139,31.1239,21.6317,30,126,0.66,0.0996,0,15,11.4741,4.3857,0,0
+Distance-Matched | Unweighted,0.9507,0.3351,142,1991,77.621,164.0471,127,128,0.9023,0.2197,38,732,100.6945,63.1614,97,125
+Unmatched | Weighted,0.6815,0.1778,0,131,31.9729,16.6723,40,125,0.6782,0.1064,0,54,11.9622,4.4363,0,0
+Unmatched | Unweighted,0.9403,0.327,130,1900,78.4053,189.6439,128,128,0.9417,0.2166,29,707,115.3658,91.5926,93,122
