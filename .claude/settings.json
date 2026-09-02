@@ -34,7 +34,8 @@
       "Bash(python3 -)",
       "Read(//c/Users/User/anaconda3/Lib/site-packages/pandas/core/groupby/**)",
       "Bash(/c/Users/User/anaconda3/envs/depnet/python.exe -c ' *)",
-      "Bash(\"/c/Users/User/anaconda3/envs/depnet/python.exe\" \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\773695ec-244a-4f48-a0e2-c3a5341556fa\\\\scratchpad\\\\covisit_diagnostic.py\")"
+      "Bash(\"/c/Users/User/anaconda3/envs/depnet/python.exe\" \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-User-Documents-research-dependency-link-prediction\\\\773695ec-244a-4f48-a0e2-c3a5341556fa\\\\scratchpad\\\\covisit_diagnostic.py\")",
+      "Bash(git rm *)"
     ]
   }
 }
