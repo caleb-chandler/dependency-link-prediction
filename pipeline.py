@@ -11,6 +11,106 @@ from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
 import statsmodels.api as sm
 import pickle
+import psutil
+import os
+
+
+def _log_mem(label):
+    """Diagnostic checkpoint: process RSS + system-wide available memory, in GiB.
+    Only for tracking down where a run's memory peaks -- not used in any calculation."""
+    rss = psutil.Process(os.getpid()).memory_info().rss / 1e9
+    avail = psutil.virtual_memory().available / 1e9
+    print(f"[mem] {label}: process RSS={rss:.2f} GiB, system available={avail:.2f} GiB", flush=True)
+
+
+def _chunked_logit_hessian(self, params, chunk_size=500_000):
+    """Drop-in, numerically equivalent replacement for
+    statsmodels.discrete.discrete_model.Logit.hessian.
+
+    The original does `-np.dot(L*(1-L)*X.T, X)`, which broadcasts a length-n
+    vector against the (p, n) transpose of the full exog matrix, materializing
+    a full new (p, n) array before the matmul. At millions of rows that's
+    another full-size copy of X on top of everything else already resident --
+    confirmed (via _log_mem) to be exactly what was crashing the kernel with
+    an unrecoverable OOM, since statsmodels' base LikelihoodModel.fit() always
+    calls .hessian() once after optimization (regardless of solver) to get the
+    covariance matrix for standard errors/p-values/CIs, unless skip_hessian=True
+    -- which isn't usable here since we need those stats for the regression
+    tables.
+
+    X.T @ diag(w) @ X is a sum over rows, so it can be accumulated in chunks
+    with peak memory bounded by one chunk (chunk_size x p) instead of the
+    full (p x n). Same result, just computed without the giant intermediate.
+    """
+    X = self.exog
+    L = self.predict(params)
+    n, p = X.shape
+    _log_mem(f"entered _chunked_logit_hessian (n={n}, p={p})")
+    hess = np.zeros((p, p), dtype=X.dtype)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        w = L[start:end] * (1 - L[start:end])
+        Xc = X[start:end]
+        hess -= (Xc * w[:, None]).T.dot(Xc)
+    _log_mem("finished _chunked_logit_hessian")
+    return hess
+
+
+def _chunked_binary_predict(self, params, exog=None, which="mean", linear=None,
+                             offset=None, chunk_size=1_000_000):
+    """Drop-in replacement for BinaryModel.predict (used by Logit).
+
+    The original does one call: `linpred = np.dot(exog, params) + offset`, a
+    single BLAS matrix-vector product over the *entire* exog matrix at once.
+    On this machine, at this network's scale (~7.77M x 130), that single call
+    reliably kills the kernel process outright -- no Python exception, no
+    MemoryError, just gone (confirmed via per-call _log_mem tracing: dies
+    between "predict call start" and its own first line of work, before any
+    of our own code after it ever runs). Since `predict()` is called on every
+    single loglike/score evaluation during optimization, this makes the model
+    entirely unfittable at full scale regardless of solver, check_rank, or
+    hessian chunking.
+
+    A plain matrix-vector product decomposes additively over row-chunks, so
+    this produces numerically identical output -- it's just N smaller BLAS
+    calls concatenated instead of one giant one. Whatever the underlying
+    issue is (this was never fully root-caused -- isolated microbenchmarks of
+    plain np.dot were themselves too flaky to pin down consistently, but the
+    real pipeline consistently died at this exact call), chunking sidesteps
+    it entirely.
+    """
+    if linear is not None:
+        if linear is True:
+            which = "linear"
+    if offset is None and exog is None and hasattr(self, 'offset'):
+        offset = self.offset
+    elif offset is None:
+        offset = 0.
+    if exog is None:
+        exog = self.exog
+
+    n = exog.shape[0]
+    linpred = np.empty(n, dtype=exog.dtype)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        linpred[start:end] = np.dot(exog[start:end], params) + offset
+
+    if which == "mean":
+        return self.cdf(linpred)
+    elif which == "linear":
+        return linpred
+    elif which == "var":
+        mu = self.cdf(linpred)
+        return mu * (1 - mu)
+    else:
+        raise ValueError('Only `which` is "mean", "linear" or "var" are'
+                         ' available.')
+
+
+sm.Logit.predict = _chunked_binary_predict
+
+
+sm.Logit.hessian = _chunked_logit_hessian
 
 # ===================================================================
 # EMBEDDING STORE
@@ -987,10 +1087,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if 'time' in features or 'income' in features:
             add_outside_metadata(G)
 
+    _log_mem("before building train feature matrices")
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
         train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
+    _log_mem("after X_train_pos built")
     X_train_neg, _, _ = build_feature_matrix(
         train_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
+    _log_mem("after X_train_neg built")
 
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
@@ -1009,6 +1112,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     print(
         f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
+    _log_mem("after training matrix assembled + originals freed")
 
     # ===== Train =====
 
@@ -1025,13 +1129,35 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # (millions of rows) that's much more expensive than L-BFGS's gradient-only
     # (O(n*p)) iterations. Same MLE either way.
     X_train = sm.add_constant(X_train)
-    link_model = sm.Logit(y_train, X_train, check_rank=False).fit(
-        method='lbfgs', maxiter=200)
+    exog_names = ['const'] + feature_names
+    # statsmodels does exog = np.asarray(exog, dtype=float) during Logit's
+    # __init__ regardless of check_rank. Passing a DataFrame here -- even one
+    # already fully float64 -- still triggers a full-size copy, because
+    # add_constant's column insertion leaves the DataFrame internally split
+    # into 2 separate memory blocks (the inserted 'const' column + the
+    # original data), so there's no single contiguous buffer to hand back
+    # as-is; converting a multi-block DataFrame to an array is necessarily a
+    # copy (confirmed via a microbenchmark: DataFrame input always copies,
+    # ~8 GiB at this network's scale, regardless of matching dtype -- that's
+    # what exhausted memory and crashed the kernel outright). Consolidating to
+    # a plain ndarray ourselves first and passing *that* (confirmed via the
+    # same microbenchmark to be a true zero-copy view inside Logit) means only
+    # one float64 copy ever exists instead of two. Column names are restored
+    # on the model afterward so downstream summary tables are unaffected.
+    X_train = X_train.to_numpy(dtype=np.float64)
+    _log_mem("after add_constant + consolidating to ndarray, right before Logit(...) construction")
+    link_mod = sm.Logit(y_train, X_train, check_rank=False)
+    link_mod.data.xnames = exog_names
+    _log_mem("after Logit(...) constructed, right before .fit()")
+
+    link_model = link_mod.fit(method='lbfgs', maxiter=200)
+    _log_mem("after link_model.fit() returned")
 
     # print out description excluding embeddings
+    # (summary2().tables[1] is already a DataFrame in this statsmodels version,
+    # not a SimpleTable -- it has no .as_html(), so use it directly)
     if 'emb' in features:
-        coef_table = pd.read_html(
-            link_model.summary2().tables[1].as_html(), header=0, index_col=0)[0]
+        coef_table = link_model.summary2().tables[1]
         emb_features = [
             name for name in feature_names if name.startswith('emb_')]
         filt_summary = coef_table.drop(index=emb_features)
@@ -1047,6 +1173,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
+    # X_train got a 'const' column prepended via sm.add_constant() before
+    # fitting (link_model.params has len(feature_names)+1 entries); X_test
+    # needs the same column so link_model.predict(X_test) sees matching
+    # shapes -- this was missing entirely, a pre-existing bug unrelated to
+    # tonight's other fixes (never previously exercised since no prior run
+    # reached this line with a real fit).
+    X_test = sm.add_constant(X_test, has_constant='add')
     y_test = np.concatenate([
         np.ones(len(X_test_pos)),
         np.zeros(len(X_test_neg))
@@ -1164,17 +1297,25 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
             X_test_pos /= str_std
 
         X_train_pos = sm.add_constant(X_train_pos)
-        str_model = sm.Logit(y_str_train, X_train_pos, check_rank=False).fit(
-            method='lbfgs', maxiter=200)
+        str_exog_names = ['const'] + feature_names
+        X_train_pos = X_train_pos.to_numpy(dtype=np.float64)
+        _log_mem("strength head: after consolidating to ndarray, before Logit(...) construction")
+        str_mod = sm.Logit(y_str_train, X_train_pos, check_rank=False)
+        str_mod.data.xnames = str_exog_names
+        _log_mem("strength head: after Logit(...) constructed, right before .fit()")
+        str_model = str_mod.fit(method='lbfgs', maxiter=200)
+        _log_mem("strength head: after str_model.fit() returned")
 
         if 'emb' in features:
-            coef_table = pd.read_html(
-                str_model.summary2().tables[1].as_html(), header=0, index_col=0)[0]
+            coef_table = str_model.summary2().tables[1]
             filt_summary = coef_table.drop(index=emb_features)
             print(filt_summary)
         else:
             print(str_model.summary2())
 
+        # same missing-constant issue as X_test above: X_test_pos never got
+        # the 'const' column that X_train_pos received before fitting
+        X_test_pos = sm.add_constant(X_test_pos, has_constant='add')
         str_probs = str_model.predict(X_test_pos)
         str_preds = (str_probs >= 0.5).astype(int)
         str_auc = roc_auc_score(y_str_test, str_probs)
