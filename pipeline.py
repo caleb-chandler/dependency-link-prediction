@@ -13,6 +13,7 @@ import statsmodels.api as sm
 import pickle
 import psutil
 import os
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 def _log_mem(label):
@@ -20,7 +21,8 @@ def _log_mem(label):
     Only for tracking down where a run's memory peaks -- not used in any calculation."""
     rss = psutil.Process(os.getpid()).memory_info().rss / 1e9
     avail = psutil.virtual_memory().available / 1e9
-    print(f"[mem] {label}: process RSS={rss:.2f} GiB, system available={avail:.2f} GiB", flush=True)
+    print(
+        f"[mem] {label}: process RSS={rss:.2f} GiB, system available={avail:.2f} GiB", flush=True)
 
 
 def _chunked_logit_hessian(self, params, chunk_size=500_000):
@@ -57,7 +59,7 @@ def _chunked_logit_hessian(self, params, chunk_size=500_000):
 
 
 def _chunked_binary_predict(self, params, exog=None, which="mean", linear=None,
-                             offset=None, chunk_size=1_000_000):
+                            offset=None, chunk_size=1_000_000):
     """Drop-in replacement for BinaryModel.predict (used by Logit).
 
     The original does one call: `linpred = np.dot(exog, params) + offset`, a
@@ -566,6 +568,8 @@ BINARY_OPERATORS = {
     'hadamard': lambda a, b: np.multiply(a, b),
     'w-l1': lambda a, b: np.abs(np.subtract(a, b)),
     'w-l2': lambda a, b: np.square(np.subtract(a, b)),
+    # cosine similarity operates on whole vectors (not element-wise)
+    'cosine': lambda a, b: cosine_similarity(a, b)
 }
 
 
@@ -652,20 +656,20 @@ def haversine(lat_u, lng_u, lat_v, lng_v):
 def edge_distances_km(G, edges):
     """Haversine distance between endpoints of each (u, v) edge in `edges`. For use in strength task."""
     if not edges:
-        return np.array([], dtype=np.float64)
+        return np.array([], dtype=np.float32)
     if not nx.get_node_attributes(G, 'latitude'):
-        # agg nodes have no single lat/lon (COORDS_ARR instead); these are
-        # real graph edges, so use the exact precomputed edge distance
-        dist_attr = 'DIST_KM_MEAN' if nx.get_edge_attributes(G, 'DIST_KM_MEAN') else 'DIST_KM'
-        return np.array([G[u][v].get(dist_attr, 0.0) for u, v in edges], dtype=np.float64)
+        # real graph edges so use precomputed distance
+        dist_attr = 'DIST_KM_MEAN' if nx.get_edge_attributes(
+            G, 'DIST_KM_MEAN') else 'DIST_KM'
+        return np.array([G[u][v].get(dist_attr, 0.0) for u, v in edges], dtype=np.float32)
     lat_u = np.radians(np.array(
-        [G.nodes[u].get('latitude') or 0.0 for u, _ in edges], dtype=np.float64))
+        [G.nodes[u].get('latitude') or 0.0 for u, _ in edges], dtype=np.float32))
     lng_u = np.radians(np.array(
-        [G.nodes[u].get('longitude') or 0.0 for u, _ in edges], dtype=np.float64))
+        [G.nodes[u].get('longitude') or 0.0 for u, _ in edges], dtype=np.float32))
     lat_v = np.radians(np.array(
-        [G.nodes[v].get('latitude') or 0.0 for _, v in edges], dtype=np.float64))
+        [G.nodes[v].get('latitude') or 0.0 for _, v in edges], dtype=np.float32))
     lng_v = np.radians(np.array(
-        [G.nodes[v].get('longitude') or 0.0 for _, v in edges], dtype=np.float64))
+        [G.nodes[v].get('longitude') or 0.0 for _, v in edges], dtype=np.float32))
     a = np.sin((lat_v - lat_u) / 2) ** 2 + np.cos(lat_u) * \
         np.cos(lat_v) * np.sin((lng_v - lng_u) / 2) ** 2
     a = np.clip(a, 0.0, 1.0)
@@ -1145,7 +1149,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # one float64 copy ever exists instead of two. Column names are restored
     # on the model afterward so downstream summary tables are unaffected.
     X_train = X_train.to_numpy(dtype=np.float64)
-    _log_mem("after add_constant + consolidating to ndarray, right before Logit(...) construction")
+    _log_mem(
+        "after add_constant + consolidating to ndarray, right before Logit(...) construction")
     link_mod = sm.Logit(y_train, X_train, check_rank=False)
     link_mod.data.xnames = exog_names
     _log_mem("after Logit(...) constructed, right before .fit()")
@@ -1154,8 +1159,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     _log_mem("after link_model.fit() returned")
 
     # print out description excluding embeddings
-    # (summary2().tables[1] is already a DataFrame in this statsmodels version,
-    # not a SimpleTable -- it has no .as_html(), so use it directly)
     if 'emb' in features:
         coef_table = link_model.summary2().tables[1]
         emb_features = [
@@ -1173,12 +1176,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
-    # X_train got a 'const' column prepended via sm.add_constant() before
-    # fitting (link_model.params has len(feature_names)+1 entries); X_test
-    # needs the same column so link_model.predict(X_test) sees matching
-    # shapes -- this was missing entirely, a pre-existing bug unrelated to
-    # tonight's other fixes (never previously exercised since no prior run
-    # reached this line with a real fit).
     X_test = sm.add_constant(X_test, has_constant='add')
     y_test = np.concatenate([
         np.ones(len(X_test_pos)),
@@ -1299,7 +1296,8 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         X_train_pos = sm.add_constant(X_train_pos)
         str_exog_names = ['const'] + feature_names
         X_train_pos = X_train_pos.to_numpy(dtype=np.float64)
-        _log_mem("strength head: after consolidating to ndarray, before Logit(...) construction")
+        _log_mem(
+            "strength head: after consolidating to ndarray, before Logit(...) construction")
         str_mod = sm.Logit(y_str_train, X_train_pos, check_rank=False)
         str_mod.data.xnames = str_exog_names
         _log_mem("strength head: after Logit(...) constructed, right before .fit()")
@@ -1313,8 +1311,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         else:
             print(str_model.summary2())
 
-        # same missing-constant issue as X_test above: X_test_pos never got
-        # the 'const' column that X_train_pos received before fitting
         X_test_pos = sm.add_constant(X_test_pos, has_constant='add')
         str_probs = str_model.predict(X_test_pos)
         str_preds = (str_probs >= 0.5).astype(int)

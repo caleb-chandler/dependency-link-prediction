@@ -1,0 +1,15 @@
+,Value
+Dependent Variable,y
+No. Observations,7838674
+Df Model,129.0
+Df Residuals,7838544.0
+Converged,True
+Iterations,82
+Covariance Type,nonrobust
+Log-Likelihood,-3681298.7808
+LL-Null (intercept only),-5433353.2559
+LLR chi2,3504108.9503
+LLR p-value,0.0
+Pseudo R-squ. (McFadden's),0.3225
+AIC,7362857.5616
+BIC,7364661.257
