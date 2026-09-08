@@ -429,27 +429,46 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
 
 
 def prepare_data(
-    fpath, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, meta=None,
+    pos_path, neg_path, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, meta=None,
     trainfile='data/train.txt', controlled=True, n_bins=50, dist_type='mean'
 ):
     """
     Prepare data for link prediction pipeline.
 
-    This function loads a graph from a file, splits it into training and testing sets,
-    saves the resulting training graph in the root folder, and outputs negative training edges,
-    negative test edges, and positive test edges.
+    This function loads two sets of positive and negative edges respectively, splits them into 
+    training and testing sets, saves the resulting training graph, and outputs negative training edges,
+    negative test edges, and positive test edges, along with their attrs, as DataFrames.
 
     Parameters:
-    fpath (str): Path to the graph file. Must be readable as an edgelist.
+    pos_path and neg_path (str): Paths to the graph files. Must be readable as edgelists.
     test_frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
     seed (int, optional): Seed for reproducibility.
+    compress (int, optional): Option to log-compress weights when creating training graph
 
     Returns:
-    nx.Graph : original graph if metadata needed for pipeline
-    list : list of negative training samples
-    list : list of positive testing samples
-    list : list of negative testing samples
+    file : file consisting of the positive training graph as an edgelist. saved to 'trainfile'
+    pd.DataFrame : negative training samples
+    pd.DataFrame : positive testing samples
+    pd.DataFrame : negative testing samples
     """
+    # TODO: finish rebuild + add compression functionality if needed again for some reason
+
+    # --- read in data ---
+
+    # downcast for better performance
+    _dtypes = {
+        'NODE_A': 'category', 'NODE_B': 'category',
+        'N_COVISITS': 'float32', 'DIST_KM_MIN': 'float32',
+        'DIST_KM_MEAN': 'float32', 'DIST_KM_MEDIAN': 'float32',
+        'DIST_KM_CENTROID': 'float32', 'N_UIDS_A': 'float32',
+        'N_POIS_A': 'float32', 'N_VISITS_A': 'float32',
+        'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
+        'N_VISITS_B': 'float32', 'DEP': 'float32'
+    }
+
+    def fast_read_csv(fpath):
+        headers = pd.read_csv(fpath, nrows=0).columns
+        _dtypes = {col: 'float32' for col in headers}
 
     if seed is not None:
         random.seed(seed)
@@ -458,86 +477,43 @@ def prepare_data(
     capweight = 'DEP' if weight == 'dep' else (
         'N_COVISITS' if weight == 'cov' else None)
 
-    def split(G, frac=test_frac):
-        # load edges as sorted tuples for efficiency
+    print('Converting to nx.Graph for MST...')
+    # add index as col
+    edgelist = edgelist.reset_index()
+    G = nx.from_pandas_edgelist(
+        edgelist, 'NODE_A', 'NODE_B', edge_attr='index')
+
+    def split(edgelist, sign, frac=test_frac):
+        if sign == 'neg':
+            test = edgelist.sample(frac, random_state=seed)
+            train = edgelist.drop(test.index)
+            return train, test
+
+        # if pos then use nx.Graph to find mst edges, then go back to df and sample while excluding them
         edges = {tuple(sorted(e)) for e in G.edges()}
-        mst = {tuple(sorted(e))
-               for e in nx.maximum_spanning_tree(G, weight=capweight if weight else None)}
+        mst_idx = [d['index'] for _, _, d in
+                   nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
+        num_removable = len(edges) - len(mst_idx)
+        test_num = (frac) * len(edgelist)
+        if num_removable < test_num:
+            raise SystemExit(
+                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(num_removable)} available.)')
 
-        removable_edges = sorted(edges - mst)
-        test_num = int(len(edges) * frac)
-        if len(removable_edges) < test_num:
-            print(
-                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(removable_edges)} available.)')
-
-        # fast set difference
-        test_count = min(test_num, len(removable_edges))
-        test_edges = random.sample(removable_edges, test_count)
-        train_edges = sorted(edges - set(test_edges))
+        # apply back to df
+        edgelist_safe = edgelist.drop(index=mst_idx)
+        # sample the same amount from edgelist_safe as would be needed to sample frac from original
+        test = edgelist_safe.sample(
+            n=int(round(test_num)), random_state=seed)
+        train = edgelist.drop(test.index)
 
         # build training graph
-        G_train = nx.Graph()
-        G_train.add_nodes_from(G.nodes())
-
-        # handle weights or not
-        if not weight:
-            G_train.add_edges_from(train_edges)
-        elif not agg:
-            if weight == 'dep':
-                G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['DEP']) for u, v in train_edges])
-            elif weight == 'cov':
-                G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
-            else:
-                # fallback for invalid weights when agg is False
-                print(
-                    f'Value "{weight}" not recognized when agg=False. Falling back to unweighted.')
-                G_train.add_edges_from(train_edges)
+        if weight:
+            G_train = nx.from_pandas_edgelist(
+                train, 'NODE_A', 'NODE_B', edge_attr=capweight)
         else:
-            if weight == 'cov':
-                G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['N_COVISITS']) for u, v in train_edges])
-            elif weight == 'dep':
-                G_train.add_weighted_edges_from(
-                    [(u, v, G[u][v]['DEP']) for u, v in train_edges])
-            else:
-                # fallback for invalid weights when agg is True
-                print(
-                    f'Value "{weight}" not recognized when agg=True. Falling back to unweighted.')
-                G_train.add_edges_from(train_edges)
+            G_train = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
 
-        # sampling
-        if controlled:
-            dist_bins, _ = distribution_finder(
-                G, dist_type=dist_type, n_bins=n_bins)
-            test_non_edges = dist_controlled_sampler(
-                G, dist_bins, len(test_edges))
-            train_non_edges = dist_controlled_sampler(
-                G, dist_bins, len(train_edges), avoid=test_non_edges)
-        else:
-            # function to sample non-edges randomly
-            def sample_non_edges(G, count):
-                non_edges = set()
-                nodes = list(G.nodes())
-                with tqdm(total=count, desc='sampling non-edges', unit='edge', leave=False) as pbar:
-                    while len(non_edges) < count:
-                        u, v = sorted(random.sample(nodes, 2))
-                        if not G.has_edge(u, v) and (u, v) not in non_edges:
-                            non_edges.add((u, v))
-                            pbar.update(1)
-                return list(non_edges)
-
-            test_non_edges = sample_non_edges(G, len(test_edges))
-            train_non_edges = sample_non_edges(G, len(train_edges))
-
-        return G_train, test_edges, test_non_edges, train_non_edges
-
-    # load in graph
-    G = load(fpath, compress=compress)
-    if G.number_of_nodes() == 0:
-        raise SystemExit(
-            f"Error: Graph loaded from {fpath} is entirely empty.")
+        return G_train, test
 
     # extracting lcc in case disconnected
     largest_cc = max(nx.connected_components(G), key=len)
@@ -601,6 +577,7 @@ def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
 
 
 def node_to_comm(G):
+    # TODO: before you use this again have it add a step to convert df to nx.Graph
     im = Infomap("--num-trials 20")
     im_to_nx = im.add_networkx_graph(G)
     print("Running Infomap...")
@@ -910,6 +887,13 @@ def build_feature_matrix(
 # RUN_PIPELINE
 # ====================================================================
 
+''' 
+not needed:
+- G
+- likely some of the kwargs
+
+'''
+
 
 def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
                  mode='PreComp', operator='hadamard', agg=False, **kwargs):
@@ -1002,15 +986,6 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     else:
         if features == 'all' or features == ['all']:
             features = ['emb', 'dist', 'comm', 'time', 'income']
-
-    # ===== Validation =====
-    needs_metadata = bool({'dist', 'cat', 'cbg', 'comm',
-                          'time', 'income'} & set(features))
-    if needs_metadata and G is None:
-        raise ValueError(
-            "Graph G with node attributes is required when features "
-            f"include {[f for f in features if f != 'emb']}"
-        )
 
     # convert training graph to nx.Graph object
     G_train = nx.read_edgelist(
