@@ -122,7 +122,7 @@ sm.Logit.hessian = _chunked_logit_hessian
 class EmbeddingMap:
     """Memory-efficient node embedding store.
 
-    Takes node list and embedding matrix outputted by pecanpy and converts to 
+    Takes embedding matrix and node list outputted by pecanpy and converts to 
     float32 matrix plus node:row index dict. filters out None entries in the node 
     list so that the matrix is smaller than the input embeddings array.
 
@@ -654,9 +654,10 @@ def edge_distances_km(G, edges):
 
 
 def build_feature_matrix(
-        edges, G, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
+        edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
 ):
     """
+    TODO: update this
     Build a feature matrix for a list of node pairs.
 
     Each row corresponds to one edge (u, v). The columns are determined
@@ -690,24 +691,9 @@ def build_feature_matrix(
     """
     op_fn = BINARY_OPERATORS[operator]
 
-    # pre-filter edges missing embeddings to ensure matrix shapes align later
-    valid_edges = []
-    kept_indices = []
-
-    if 'emb' in features:
-        for idx, (u, v) in enumerate(edges):
-            if u in embedding_map and v in embedding_map:
-                valid_edges.append((u, v))
-                kept_indices.append(idx)
-    else:
-        valid_edges = edges
-        kept_indices = list(range(len(edges)))
-
-    if not valid_edges:
-        return np.empty((0, 0)), [], []
-
-    # unzip the list of tuples into two parallel lists of origins (U) and destinations (V)
-    U, V = zip(*valid_edges)
+    # unzip the edges into two parallel arrays of origins and destinations
+    U, V = edges['NODE_A'], edges['NODE_B']
+    kept_indices = list(range(len(edges)))
 
     feature_blocks = []
     feature_names = []
@@ -723,157 +709,91 @@ def build_feature_matrix(
             emb_u = np.asarray([embedding_map[u] for u in U], dtype=np.float32)
             emb_v = np.asarray([embedding_map[v] for v in V], dtype=np.float32)
 
-        # binary operator applies to whole array simultaneously
+        # binary operator applies to both arrays simultaneously
         emb_feat = op_fn(emb_u, emb_v)
         feature_blocks.append(emb_feat)
         feature_names.extend(
             f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
-    if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
-        print('Make sure you remember to not standardize dummies')
-        if 'cat' in features:
-            # count each undirected type-pair across all edges in G
-            pair_counts = {}
-            for eu, ev in G.edges():
-                cu = G.nodes[eu].get('poi_type', 'Unknown')
-                cv = G.nodes[ev].get('poi_type', 'Unknown')
-                pair = tuple(sorted([cu, cv]))
-                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    # TODO: fix if using POI-level again
+    # if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
+    #     print('Make sure you remember to not standardize dummies')
+    #     if 'cat' in features:
+    #         # count each undirected type-pair across all edges in G
+    #         pair_counts = {}
+    #         for eu, ev in G.edges():
+    #             cu = G.nodes[eu].get('poi_type', 'Unknown')
+    #             cv = G.nodes[ev].get('poi_type', 'Unknown')
+    #             pair = tuple(sorted([cu, cv]))
+    #             pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
-            # only pairs observed >= cat_threshold times, sorted for stable columns
-            vocab = sorted(p for p, cnt in pair_counts.items()
-                           if cnt >= cat_threshold)
-            print(
-                f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
-            pair_to_idx = {p: i for i, p in enumerate(vocab)}
+    #         # only pairs observed >= cat_threshold times, sorted for stable columns
+    #         vocab = sorted(p for p, cnt in pair_counts.items()
+    #                        if cnt >= cat_threshold)
+    #         print(
+    #             f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
+    #         pair_to_idx = {p: i for i, p in enumerate(vocab)}
 
-            cat_feat = np.zeros((len(U), len(vocab)))
-            for i, (u, v) in enumerate(zip(U, V)):
-                cu = G.nodes[u].get('poi_type', 'Unknown')
-                cv = G.nodes[v].get('poi_type', 'Unknown')
-                pair = tuple(sorted([cu, cv]))
-                idx = pair_to_idx.get(pair)
-                if idx is not None:
-                    cat_feat[i, idx] = 1.0
+    #         cat_feat = np.zeros((len(U), len(vocab)))
+    #         for i, (u, v) in enumerate(zip(U, V)):
+    #             cu = G.nodes[u].get('poi_type', 'Unknown')
+    #             cv = G.nodes[v].get('poi_type', 'Unknown')
+    #             pair = tuple(sorted([cu, cv]))
+    #             idx = pair_to_idx.get(pair)
+    #             if idx is not None:
+    #                 cat_feat[i, idx] = 1.0
 
-            feature_blocks.append(cat_feat)
-            feature_names.extend(f'cat_{a}||{b}' for a, b in vocab)
+    #         feature_blocks.append(cat_feat)
+    #         feature_names.extend(f'cat_{a}||{b}' for a, b in vocab)
 
-        if 'catsame' in features:
-            cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
-            cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
+    #     if 'catsame' in features:
+    #         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
+    #         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
 
-            # boolean array comparison converted to floats: 1.0 for True, 0.0 for False
-            cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
-            feature_blocks.append(cat_feat)
-            feature_names.append('catsame')
+    #         # boolean array comparison converted to floats: 1.0 for True, 0.0 for False
+    #         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
+    #         feature_blocks.append(cat_feat)
+    #         feature_names.append('catsame')
 
-        if 'cbg' in features:
-            cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
-            cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
-            cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
-                        ).astype(float).reshape(-1, 1)
-            feature_blocks.append(cbg_feat)
-            feature_names.append('cbg_same')
-    elif not agg:
-        print(
-            'Category and census-based features invalid for aggregated network. Skipping.')
+    #     if 'cbg' in features:
+    #         cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
+    #         cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
+    #         cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
+    #                     ).astype(float).reshape(-1, 1)
+    #         feature_blocks.append(cbg_feat)
+    #         feature_names.append('cbg_same')
+    # elif not agg:
+    #     print(
+    #         'Category and census-based features invalid for aggregated network. Skipping.')
 
     # vectorized geographic distance
-    if 'dist' in features:
-        if nx.get_node_attributes(G, 'latitude'):
-            # convert NaNs to 0.0 while obtaining arrays of lat/lon for both u and v
-            lat_u = np.nan_to_num(np.array(
-                [G.nodes[u].get('latitude') for u in U], dtype=np.float32))
-            lng_u = np.nan_to_num(np.array(
-                [G.nodes[u].get('longitude') for u in U], dtype=np.float32))
-            lat_v = np.nan_to_num(np.array(
-                [G.nodes[v].get('latitude') for v in V], dtype=np.float32))
-            lng_v = np.nan_to_num(np.array(
-                [G.nodes[v].get('longitude') for v in V], dtype=np.float32))
-
-            # apply haversine function
-            dist_km = haversine(lat_u, lng_u, lat_v, lng_v)
-
-            # log scale and reshape to (n_pairs, 1) column vector
-            dist_feat = np.log1p(dist_km).reshape(-1, 1)
-            feature_blocks.append(dist_feat)
-            feature_names.append('log_dist_km')
-
-        elif nx.get_node_attributes(G, 'COORDS_ARR'):
-            # cache each node's coordinate array once -- nodes repeat across
-            # many edges (avg ~690x on the full agg network), so this avoids
-            # re-doing nan_to_num/astype on every occurrence
-            coords_cache = {}
-
-            def _coords(n):
-                arr = coords_cache.get(n)
-                if arr is None:
-                    arr = np.nan_to_num(
-                        G.nodes[n].get('COORDS_ARR')).astype(np.float32)
-                    coords_cache[n] = arr
-                return arr
-
-            # per-edge mean over the full POI x POI cartesian product between
-            # endpoints, looped edge-by-edge rather than stacking every
-            # combination from every edge into one array first -- doing the
-            # latter on this network tries to allocate a >1e9-row array and
-            # raises MemoryError. This keeps the exact same statistic
-            # (matches how DIST_KM_MEAN itself is defined) with peak memory
-            # bounded by the single largest bucket-pair's combination count.
-            dist_km_means = np.empty(len(valid_edges), dtype=np.float32)
-            for i, (u, v) in enumerate(valid_edges):
-                latlons_u = _coords(u)
-                latlons_v = _coords(v)
-
-                grid_u, grid_v = np.meshgrid(
-                    np.arange(latlons_u.shape[0]), np.arange(latlons_v.shape[0]), indexing='ij'
-                )
-                lat_u = latlons_u[grid_u.ravel(), 0]
-                lng_u = latlons_u[grid_u.ravel(), 1]
-                lat_v = latlons_v[grid_v.ravel(), 0]
-                lng_v = latlons_v[grid_v.ravel(), 1]
-
-                dist_km_means[i] = haversine(lat_u, lng_u, lat_v, lng_v).mean()
-
-            # log-compress
-            dist_feat = np.log1p(dist_km_means).reshape(-1, 1)
-
-            # add to features
-            feature_blocks.append(dist_feat)
-            feature_names.append('log_dist_km')
+    if 'dist_mean' in features:
+        feature_blocks.append(np.nan_to_num(
+            np.log1p(edges['DIST_KM_MEAN'].to_numpy().reshape(-1, 1))))
+        feature_names.append('log_dist_mean')
+    if 'dist_min' in features:
+        feature_blocks.append(np.nan_to_num(
+            np.log1p(edges['DIST_KM_MIN'].to_numpy().reshape(-1, 1))))
+        feature_names.append('log_dist_min')
+    if 'dist_median' in features:
+        feature_blocks.append(
+            np.nan_to_num(np.log1p(edges['DIST_KM_MEDIAN'].to_numpy().reshape(-1, 1))))
+        feature_names.append('log_dist_median')
+    if 'dist_centroid' in features:
+        feature_blocks.append(
+            np.nan_to_num(np.log1p(edges['DIST_KM_CENTROID'].to_numpy().reshape(-1, 1))))
+        feature_names.append('log_dist_centroid')
 
     if 'comm' in features:
-        comm_u = np.array([G.nodes[u].get('community', -1) for u in U])
-        comm_v = np.array([G.nodes[v].get('community', -1) for v in V])
-        comm_feat = ((comm_u == comm_v) & (comm_u != -1)
-                     ).astype(float).reshape(-1, 1)
-        feature_blocks.append(comm_feat)
-        feature_names.append('comm_same')
+        # TODO: fill in if using comm
+        pass
 
     if 'time' in features:
-        # uniform distribution for fallback
-        default_distr = np.array([0.25, 0.25, 0.25, 0.25])
-        time_u = np.array(
-            [G.nodes[u].get('time_dist', default_distr) for u in U])
-        time_v = np.array(
-            [G.nodes[v].get('time_dist', default_distr) for v in V])
-        js_dist = jensenshannon(time_u, time_v, axis=1)
-        time_feat = (js_dist ** 2).reshape(-1, 1)
-        feature_blocks.append(time_feat)
-        feature_names.append('time_js_div')
+        # TODO: probably something like add 4 cols to df for each node's distribution then add new col for js div
+        pass
 
     if 'income' in features:
-        # uniform distribution for fallback
-        default_distr = np.array([0.25, 0.25, 0.25, 0.25])
-        inc_u = np.array(
-            [G.nodes[u].get('inc_dist', default_distr) for u in U])
-        inc_v = np.array(
-            [G.nodes[v].get('inc_dist', default_distr) for v in V])
-        js_dist = jensenshannon(inc_u, inc_v, axis=1)
-        inc_feat = (js_dist ** 2).reshape(-1, 1)
-        feature_blocks.append(inc_feat)
-        feature_names.append('income_js_div')
+        pass
 
     if 'ls' in features:
         pass
@@ -895,8 +815,8 @@ not needed:
 '''
 
 
-def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None, features=['emb'],
-                 mode='PreComp', operator='hadamard', agg=False, **kwargs):
+def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_edges, features=['emb'],
+                 mode='SparseOTF', operator='hadamard', agg=False, **kwargs):
     """
     Run the link prediction pipeline with flexible feature composition. Features controlled by `features` list.
 
@@ -917,7 +837,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     features : list of str or 'all'
         Which features to include. Default ['emb']. If 'all' then includes all features.
     mode : str
-        PecanPy walk mode. Default 'PreComp'.
+        PecanPy walk mode. Default 'SparseOTF'.
     operator : str
         Binary operator for embeddings. Default 'hadamard'.
     **kwargs :
@@ -968,18 +888,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     strength_dist_control = kwargs.get('strength_dist_control', True)
     standardize = kwargs.get('standardize', False)
 
-    if agg and G:
-        if any(nx.get_node_attributes(G, 'COORDS_ARR')):
-            # make sure array exists for every node
-            assert all(data.get('COORDS_ARR') is not None
-                       for _, data in G.nodes(data=True))
-
     # seed
     seed = kwargs.get('seed', None)
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
 
+    # TODO: update
     if not agg:
         if features == 'all' or features == ['all']:
             features = ['emb', 'dist', 'cat', 'cbg', 'comm', 'time', 'income']
@@ -987,9 +902,27 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if features == 'all' or features == ['all']:
             features = ['emb', 'dist', 'comm', 'time', 'income']
 
-    # convert training graph to nx.Graph object
-    G_train = nx.read_edgelist(
-        trainfile, data=[('weight', float)], delimiter='\t')
+    # ensure none of the other 3 sets contain nodes not in train_pos
+    def node_set(df):
+        df = df[['NODE_A', 'NODE_B']].dropna()
+        return set(pd.unique(df.values.ravel()))
+
+    train_pos_nodes = node_set(train_edges)
+    missing = {
+        'test_pos':  node_set(test_edges) - train_pos_nodes,
+        'train_neg': node_set(train_non_edges) - train_pos_nodes,
+        'test_neg':  node_set(test_non_edges) - train_pos_nodes,
+    }
+    if not all(not v for v in missing.values()):
+        print(f'Error: positive training set is incomplete.')
+        for k, v in missing.items():
+            print(f'{k}: {len(v)} nodes absent from train_pos'
+                  + (f' (e.g. {sorted(v)[:3]})' if v else ''))
+        raise SystemExit
+
+    # ensure training graph is fully connected
+    G = nx.from_pandas_edgelist(train_edges, 'NODE_A', 'NODE_B')
+    assert nx.is_connected(G), 'Error: disconnected training graph.'
 
     # ===== Embedding generation (only if needed) =====
 
@@ -1053,11 +986,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     # ===== Assemble feature matrices =====
 
-    # convert to list and sort for consistent indexing
-    train_pos_edges = [tuple(sorted(e)) for e in G_train.edges()]
-
     if 'comm' in features:
-        node_to_comm(G)
+        # TODO: insert fixed node_to_comm
+        pass
 
     if not agg:
         # TODO: remove and rework if using POI-level again
@@ -1068,11 +999,13 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
 
     _log_mem("before building train feature matrices")
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
-        train_pos_edges, G, features, embedding_map, operator, cat_threshold, agg)
+        train_edges, features, embedding_map, operator, cat_threshold, agg)
     _log_mem("after X_train_pos built")
     X_train_neg, _, _ = build_feature_matrix(
-        train_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
+        train_non_edges, features, embedding_map, operator, cat_threshold, agg)
     _log_mem("after X_train_neg built")
+
+    # ===================================================================
 
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
@@ -1146,9 +1079,9 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     # ===== Test =====
 
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
-        test_edges, G, features, embedding_map, operator, cat_threshold, agg)
+        test_edges, features, embedding_map, operator, cat_threshold, agg)
     X_test_neg, _, _ = build_feature_matrix(
-        test_non_edges, G, features, embedding_map, operator, cat_threshold, agg)
+        test_non_edges, features, embedding_map, operator, cat_threshold, agg)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     X_test = sm.add_constant(X_test, has_constant='add')
@@ -1160,6 +1093,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     if standardize:
         # TODO: if you're going to use this again you need to modify the function so
         # that it fills binary cols with 0s instead of removing them
+        # (also move it up to where you can add it to train as well)
         def standardizer(train_set):
             ''' 
             Bypasses StandardScaler float64 upcasting by z-scoring in place. 
@@ -1198,6 +1132,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
     print(f"[{feature_label}{op_label}]  Link AUC = {link_auc:.4f}")
 
     # ===== strength head =====
+    # TODO: rebuild this as well whenever we use it
     if strength:
         # function to return dependencies of kept edges only
         def _dep(edges, keep):
@@ -1231,7 +1166,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
                 keep.extend(np.random.choice(w, k, replace=False))
             return np.sort(np.array(keep, dtype=int))
 
-        dep_train = _dep(train_pos_edges, keep_train_pos)
+        dep_train = _dep(train_edges, keep_train_pos)
         dep_test = _dep(test_edges, keep_test_pos)
 
         thr = np.quantile(dep_train, strength)
@@ -1241,7 +1176,7 @@ def run_pipeline(trainfile, train_non_edges, test_edges, test_non_edges, G=None,
         if strength_dist_control:
             idx_tr = _dist_matched_idx(
                 dep_train, edge_distances_km(
-                    G, [train_pos_edges[i] for i in keep_train_pos]), thr)
+                    G, [train_edges[i] for i in keep_train_pos]), thr)
             idx_te = _dist_matched_idx(
                 dep_test, edge_distances_km(
                     G, [test_edges[i] for i in keep_test_pos]), thr)
