@@ -1,0 +1,55 @@
+"# Embedding-run variance test. agg network, seed 21, external splits."
+"# feats=emb+dist_median, dim=128, p=1, q=1, epochs=1, operator held fixed."
+# Each replicate regenerates the node2vec map; everything else identical.
+# Sweep reference AUCs read from weight_None/strengthFalse/operator_sweep.txt
+
+statistic,value
+replicates_n,7
+mean_link_auc,0.800835
+sd_ddof1,0.004166
+min,0.794732
+max,0.806445
+range,0.011713
+2sd_threshold,0.008331
+band_lo,0.792504
+band_hi,0.809167
+cv_pct,0.5201
+
+replicate_hadamard_auc
+0.794732
+0.795964
+0.800927
+0.801422
+0.802777
+0.803581
+0.806445
+
+replicate_cosine_auc
+0.627649
+0.627729
+0.628076
+0.628204
+0.628645
+0.629586
+cosine_sd_ddof1,0.000718
+
+# paired within-map: hadamard - cosine (map effect removed)
+rep,hadamard,cosine,diff
+2,0.806445,0.628076,0.178369
+3,0.802777,0.627649,0.175128
+4,0.794732,0.627729,0.167003
+5,0.803581,0.629586,0.173995
+6,0.801422,0.628645,0.172777
+7,0.795964,0.628204,0.167760
+mean_diff,0.172505
+sd_diff,0.004390
+2sd_diff,0.008779
+
+operator_pair,gap,gap_over_2sd,verdict
+w-l1 vs w-l2,0.000520,0.06,within noise
+hadamard vs avg,0.014045,1.69,distinguishable
+avg vs w-l1,0.046462,5.58,distinguishable
+avg vs w-l2,0.046982,5.64,distinguishable
+hadamard vs w-l1,0.060507,7.26,distinguishable
+hadamard vs w-l2,0.061027,7.33,distinguishable
+"cosine vs hadamard (paired, n=6)",0.172505,20.71,distinguishable
