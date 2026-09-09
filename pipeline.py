@@ -13,7 +13,6 @@ import statsmodels.api as sm
 import pickle
 import psutil
 import os
-from sklearn.metrics.pairwise import cosine_similarity
 
 
 def _log_mem(label):
@@ -539,13 +538,28 @@ def prepare_data(
 # ====================================================================
 
 
+def rowwise_cosine(a, b):
+    """Cosine similarity of each paired row of a and b -> shape (n_pairs, 1).
+
+    Note sklearn's cosine_similarity(a, b) would build the full (n_a, n_b)
+    cross-product matrix; we only ever want its diagonal.
+    """
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    num = np.einsum('ij,ij->i', a, b)
+    den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    sim = np.divide(num, den, out=np.zeros_like(num), where=den != 0)
+    return sim[:, None]
+
+
 BINARY_OPERATORS = {
     'avg': lambda a, b: np.mean([a, b], axis=0),
     'hadamard': lambda a, b: np.multiply(a, b),
     'w-l1': lambda a, b: np.abs(np.subtract(a, b)),
     'w-l2': lambda a, b: np.square(np.subtract(a, b)),
-    # cosine similarity operates on whole vectors (not element-wise)
-    'cosine': lambda a, b: cosine_similarity(a, b)
+    # cosine similarity operates on whole vectors (not element-wise),
+    # so it collapses the embedding block to a single column
+    'cosine': rowwise_cosine
 }
 
 
@@ -811,7 +825,6 @@ def build_feature_matrix(
 not needed:
 - G
 - likely some of the kwargs
-
 '''
 
 
@@ -1066,12 +1079,14 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     link_model = link_mod.fit(method='lbfgs', maxiter=200)
     _log_mem("after link_model.fit() returned")
 
-    # print out description excluding embeddings
+    # print out description excluding embeddings, but keep the header block
+    # (pseudo R-squared, log-likelihood, convergence) which tables[1] alone drops
     if 'emb' in features:
-        coef_table = link_model.summary2().tables[1]
+        link_summary = link_model.summary2()
         emb_features = [
             name for name in feature_names if name.startswith('emb_')]
-        filt_summary = coef_table.drop(index=emb_features)
+        filt_summary = link_summary.tables[1].drop(index=emb_features)
+        print(link_summary.tables[0])
         print(filt_summary)
     else:
         print(link_model.summary2())
@@ -1215,8 +1230,9 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
         _log_mem("strength head: after str_model.fit() returned")
 
         if 'emb' in features:
-            coef_table = str_model.summary2().tables[1]
-            filt_summary = coef_table.drop(index=emb_features)
+            str_summary = str_model.summary2()
+            filt_summary = str_summary.tables[1].drop(index=emb_features)
+            print(str_summary.tables[0])
             print(filt_summary)
         else:
             print(str_model.summary2())
