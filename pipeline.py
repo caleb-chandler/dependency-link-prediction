@@ -829,7 +829,7 @@ not needed:
 
 
 def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_edges, features=['emb'],
-                 mode='SparseOTF', operator='hadamard', agg=False, **kwargs):
+                 standardize=False, mode='SparseOTF', operator='hadamard', agg=False, **kwargs):
     """
     Run the link prediction pipeline with flexible feature composition. Features controlled by `features` list.
 
@@ -851,6 +851,8 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
         Which features to include. Default ['emb']. If 'all' then includes all features.
     mode : str
         PecanPy walk mode. Default 'SparseOTF'.
+    standardize : bool
+        Flag for z-score standardization of predictor variables.
     operator : str
         Binary operator for embeddings. Default 'hadamard'.
     **kwargs :
@@ -899,7 +901,6 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
-    standardize = kwargs.get('standardize', False)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1018,13 +1019,37 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
         train_non_edges, features, embedding_map, operator, cat_threshold, agg)
     _log_mem("after X_train_neg built")
 
-    # ===================================================================
-
     X_train = np.vstack([X_train_pos, X_train_neg])
     y_train = np.concatenate([
         np.ones(len(X_train_pos)),
         np.zeros(len(X_train_neg))
     ])
+
+    if standardize:
+        def standardizer(train_set):
+            ''' 
+            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+            Stats are accumulated in float64 for numerical stability, then cast back.
+            '''
+            # exclude dummy variables from standardization
+            # (mask if vals are only in set of 0 and 1)
+            dummies = np.isin(train_set, [0, 1]).all(axis=0)
+
+            train_mean = train_set.mean(
+                axis=0, dtype=np.float64).astype(np.float32)
+            train_std = train_set.std(
+                axis=0, dtype=np.float64).astype(np.float32)
+
+            # identity for subtraction and division respectively
+            # also ensure 0s dont enter into std dev for div by zero
+            train_mean[dummies] = 0.0
+            train_std[dummies] = 1.0
+            train_std[train_std == 0] = 1.0
+            train_set -= train_mean
+            train_set /= train_std
+
+            return train_set, train_mean, train_std
+        X_train, train_mean, train_std = standardizer(X_train)
 
     # convert Xs to df for feature names and standardization gates
     X_train = pd.DataFrame(X_train, columns=feature_names)
@@ -1106,31 +1131,8 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     ])
 
     if standardize:
-        # TODO: if you're going to use this again you need to modify the function so
-        # that it fills binary cols with 0s instead of removing them
-        # (also move it up to where you can add it to train as well)
-        def standardizer(train_set):
-            ''' 
-            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
-            Stats are accumulated in float64 for numerical stability, then cast back.
-            '''
-            # exclude dummy variables and embeddings from standardization
-            # (mask if vals fall only in 0-1 range)
-            to_bypass = (train_set.min() >= 0) & (train_set.max() <= 1)
-            standardizable = train_set.columns[~to_bypass]
-
-            train_mean = train_set[standardizable].mean(
-                axis=0, dtype=np.float64).astype(np.float32)
-            train_std = train_set[standardizable].std(
-                axis=0, dtype=np.float64).astype(np.float32)
-
-            train_std[train_std == 0] = 1.0  # stand-in to avoid div by 0
-            train_set[standardizable] -= train_mean
-            train_set[standardizable] /= train_std
-
-            return train_set, train_mean, train_std
-        X_train, train_mean, train_std = standardizer(X_train)
-        # apply the training z-score to the test matrix in place (same reason as above)
+        # z-score with same mean and std dev to avoid contaminating regression
+        # with unaccounted-for differences
         X_test -= train_mean
         X_test /= train_std
 

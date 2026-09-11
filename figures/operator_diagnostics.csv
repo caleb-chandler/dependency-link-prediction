@@ -1,0 +1,8 @@
+# VIF = diag(inv(corr(X))); gap = auc_train - auc_test
+# rebuild_delta = |recomputed test AUC - stored link_auc| (rebuild self-check)
+operator,converged,n_params,auc_train,auc_test,gap,auc_test_stored,rebuild_delta,vif_max,vif_median,vif_gt10,vif_gt100,corr_cond,beta_absmax,se_max,phat_min,phat_max,n_phat_lt_1e6,n_phat_gt_1m1e6,n_single_feature_separations,min_class_range_overlap
+avg,False,130,0.789978,0.789555,+0.000424,0.789555,0.00e+00,104.8,33.9,128,2,4921,15.07,0.08064,0.01453,0.99985977,0,0,0,0.852
+hadamard,False,130,0.806905,0.803889,+0.003016,0.803889,0.00e+00,57.87,8.67,54,0,1585,23.66,0.4059,0.003173,0.99954483,0,0,0,0.828
+w-l2,False,130,0.750110,0.747818,+0.002293,0.747818,0.00e+00,13.05,4.455,6,0,533.2,28.1,0.2165,0.0002811,0.99982375,0,0,0,0.722
+w-l1,True,130,0.749412,0.747081,+0.002331,0.747081,0.00e+00,6.126,3,0,0,257.5,5.803,0.03097,0.004474,0.99817896,0,0,0,0.850
+cosine,True,3,0.635277,0.629227,+0.006051,0.629227,0.00e+00,2.23,2.23,0,0,6.773,4.475,0.007623,0.0922,0.90425648,0,0,0,0.923
