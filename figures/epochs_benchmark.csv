@@ -1,0 +1,8 @@
+"# node2vec epochs benchmark; embedding-only (no feature assembly, no model fit)"
+# graph read once (13.1s) and reused; each row is one embed() call
+"# timing fit: t(epochs) = 45.16 + 26.44 * epochs, R2=0.9995"
+epochs,secs,n_nodes,n_dims,mean_abs_r,p95_abs_r,max_abs_r,median_vif,max_vif,cond,dim_std_ratio,val_std
+1,73.7,15134,128,0.2994,0.6662,0.9077,49.64,222.76,8341.3,5.423,0.15016
+2,96.5,15134,128,0.1879,0.4524,0.7993,3.97,11.43,296.3,2.651,0.16256
+4,149.6,15134,128,0.1182,0.2970,0.5765,1.87,3.34,317.6,1.690,0.18750
+8,257.5,15134,128,0.0804,0.2153,0.5036,1.49,2.66,264.0,1.638,0.20969

@@ -1,0 +1,19 @@
+# raw node-level node2vec embeddings; source: hadamard/output.pkl embedding_map
+statistic,value
+n_nodes,15134
+n_dims,128
+n_values,1937152
+value_mean,-0.009203
+value_std,0.150414
+value_min,-0.811361
+value_max,0.604880
+value_skew,-0.190088
+pct_exactly_zero,0.0000
+dim_std_min,0.058286
+dim_std_max,0.182211
+dim_std_ratio_max_over_min,3.1262
+dim_mean_absmax,0.309734
+node_norm_min,0.697592
+node_norm_median,1.655478
+node_norm_max,2.804621
+node_norm_ratio_max_over_min,4.0204
