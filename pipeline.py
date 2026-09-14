@@ -1109,9 +1109,9 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     # (pseudo R-squared, log-likelihood, convergence) which tables[1] alone drops
     if 'emb' in features:
         link_summary = link_model.summary2()
-        emb_features = [
-            name for name in feature_names if name.startswith('emb_')]
-        filt_summary = link_summary.tables[1].drop(index=emb_features)
+        emb_vec_features = [
+            name for name in feature_names if name.startswith('emb_') and not name.contains('cosine')]
+        filt_summary = link_summary.tables[1].drop(index=emb_vec_features)
         print(link_summary.tables[0])
         print(filt_summary)
     else:

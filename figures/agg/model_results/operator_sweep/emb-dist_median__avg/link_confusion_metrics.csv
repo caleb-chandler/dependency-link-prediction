@@ -1,0 +1,7 @@
+,Value
+Threshold,0.5
+Accuracy,0.7647
+Precision,0.7663
+Recall (Sensitivity),0.7617
+Specificity,0.7677
+F1,0.764
