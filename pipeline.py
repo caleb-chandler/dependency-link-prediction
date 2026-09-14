@@ -907,6 +907,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
 
     # TODO: update
     if not agg:
@@ -946,11 +947,11 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     elif 'emb' in features:
         def make_pecanpy_graph(chosen_mode, w_bool):
             if chosen_mode == 'PreComp':
-                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
+                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
             elif chosen_mode == 'SparseOTF':
-                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
+                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
             elif chosen_mode == 'DenseOTF':
-                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool)
+                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
             else:
                 raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
 

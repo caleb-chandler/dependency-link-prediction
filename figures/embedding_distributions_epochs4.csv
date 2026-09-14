@@ -1,0 +1,18 @@
+"# raw node-level node2vec embeddings, epochs=4, map 3471fa10fd"
+statistic,value
+n_nodes,15134
+n_dims,128
+n_values,1937152
+value_mean,0.014315
+value_std,0.186881
+value_min,-0.995394
+value_max,1.063578
+value_skew,-0.015591
+dim_std_min,0.130355
+dim_std_max,0.229372
+dim_std_ratio,1.7596
+dim_absmean_max,0.220654
+node_norm_min,0.963197
+node_norm_median,2.115269
+node_norm_max,2.907968
+node_norm_ratio,3.0191

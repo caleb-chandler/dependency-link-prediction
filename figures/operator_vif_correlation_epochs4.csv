@@ -1,0 +1,8 @@
+"# feats=emb+dist_median, epochs=4, embedding map 3471fa10fd"
+# VIF = diag(inv(corr(X))) on the full training design (pos+neg)
+operator,n_rows,n_cols,converged,vif_log_dist_median,vif_emb_median,vif_emb_max,n_emb_vif_gt10,mean_abs_r,p95_abs_r,max_abs_r,cond
+avg,6930242,129,True,1.3493,1.8927,3.0367,0,0.1236,0.3173,0.5637,423.0
+cosine,6930242,2,True,1.4168,1.4168,1.4168,0,0.5424,0.5424,0.5424,3.4
+hadamard,6930242,129,True,2.7087,1.2112,2.4296,0,0.0532,0.1642,0.5398,28.3
+w-l2,6930242,129,True,1.7882,1.0559,1.1568,0,0.0357,0.0758,0.2471,12.5
+w-l1,6930242,129,True,1.7720,1.0457,1.1129,0,0.0336,0.0671,0.2424,11.9

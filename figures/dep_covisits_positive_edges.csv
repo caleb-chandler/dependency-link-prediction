@@ -1,0 +1,4 @@
+# positive edge set (train+test); log-axis panels use nonzero values only
+variable,n,n_zero,pct_zero,mean,median_nonzero,p01_nonzero,p99_nonzero,min_nonzero,max,skew,n_distinct_nonzero,grid_step,frac_on_grid
+DEP,4620138,4093267,88.5962,2.73564e-07,1e-06,1e-06,1.9e-05,1e-06,0.008403,714.6327,327,1e-06,1.0000
+N_COVISITS,4620138,0,0.0000,4.40837,1,1,49,1,18660,158.7719,1366,1,1.0000
