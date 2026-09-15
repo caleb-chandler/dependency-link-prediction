@@ -713,7 +713,7 @@ def build_feature_matrix(
     feature_names = []
 
     # vectorized embeddings
-    if 'emb' in features:
+    if any(f in features for f in ('emb', 'cosine')):
         # extract to 2D arrays: shape (N_pairs, dim). one for each endpoint.
         # fancy-index the packed matrix when available; fall back to per-key lookup when not.
         if hasattr(embedding_map, 'rows'):
@@ -725,6 +725,10 @@ def build_feature_matrix(
 
         # binary operator applies to both arrays simultaneously
         emb_feat = op_fn(emb_u, emb_v)
+        if 'cosine' in features and operator != 'cosine':
+            cos_feat = rowwise_cosine(emb_u, emb_v)
+            feature_blocks.append(cos_feat)
+            feature_names.append('emb_cosine_0')
         feature_blocks.append(emb_feat)
         feature_names.extend(
             f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
@@ -941,10 +945,10 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
 
     # ===== Embedding generation (only if needed) =====
 
-    if 'emb' in features and embedding_map is not None:
+    if any(f in features for f in ('emb', 'cosine')) and embedding_map is not None:
         print(f"Using precomputed embeddings: {len(embedding_map)} nodes")
 
-    elif 'emb' in features:
+    elif any(f in features for f in ('emb', 'cosine')):
         def make_pecanpy_graph(chosen_mode, w_bool):
             if chosen_mode == 'PreComp':
                 return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
@@ -1110,7 +1114,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     if 'emb' in features:
         link_summary = link_model.summary2()
         emb_vec_features = [
-            name for name in feature_names if name.startswith('emb_') and not name.contains('cosine')]
+            name for name in feature_names if name.startswith('emb_') and not 'cosine' in name]
         filt_summary = link_summary.tables[1].drop(index=emb_vec_features)
         print(link_summary.tables[0])
         print(filt_summary)
