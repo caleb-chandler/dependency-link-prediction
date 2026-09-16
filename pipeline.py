@@ -40,7 +40,8 @@ def _node_codes(cols):
     out = []
     for c in cols:
         if hasattr(c, 'cat'):
-            out.append(nodes.get_indexer(c.cat.categories)[c.cat.codes.to_numpy()])
+            out.append(nodes.get_indexer(c.cat.categories)
+                       [c.cat.codes.to_numpy()])
         else:
             out.append(nodes.get_indexer(c))
     return out, len(nodes)
@@ -1143,33 +1144,9 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     # ===== Train =====
 
     # add constant and fit model
-    # check_rank=False: Logit's default rank check runs a full QR decomposition
-    # of the whole exog matrix as a float64 copy before fitting even starts --
-    # at this network's scale that's an 11+ GiB allocation on top of X_train
-    # already in memory, which is what was actually behind both the MemoryError
-    # and the multi-hour stalls seen earlier (the QR call runs regardless of
-    # solver). Skipping it doesn't change the fit, only a pre-flight
-    # collinearity diagnostic.
-    # method='lbfgs': default Newton-Raphson recomputes the full p x p Hessian
-    # over every row each iteration (O(n*p^2)); at this network's scale
-    # (millions of rows) that's much more expensive than L-BFGS's gradient-only
-    # (O(n*p)) iterations. Same MLE either way.
     X_train = sm.add_constant(X_train)
     exog_names = ['const'] + feature_names
-    # statsmodels does exog = np.asarray(exog, dtype=float) during Logit's
-    # __init__ regardless of check_rank. Passing a DataFrame here -- even one
-    # already fully float64 -- still triggers a full-size copy, because
-    # add_constant's column insertion leaves the DataFrame internally split
-    # into 2 separate memory blocks (the inserted 'const' column + the
-    # original data), so there's no single contiguous buffer to hand back
-    # as-is; converting a multi-block DataFrame to an array is necessarily a
-    # copy (confirmed via a microbenchmark: DataFrame input always copies,
-    # ~8 GiB at this network's scale, regardless of matching dtype -- that's
-    # what exhausted memory and crashed the kernel outright). Consolidating to
-    # a plain ndarray ourselves first and passing *that* (confirmed via the
-    # same microbenchmark to be a true zero-copy view inside Logit) means only
-    # one float64 copy ever exists instead of two. Column names are restored
-    # on the model afterward so downstream summary tables are unaffected.
+
     X_train = X_train.to_numpy(dtype=np.float64)
     _log_mem(
         "after add_constant + consolidating to ndarray, right before Logit(...) construction")
