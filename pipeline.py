@@ -9,6 +9,7 @@ import geopandas as gpd
 from shapely.geometry import Point
 from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
+from scipy.sparse import csr_matrix
 import statsmodels.api as sm
 import pickle
 import psutil
@@ -22,6 +23,69 @@ def _log_mem(label):
     avail = psutil.virtual_memory().available / 1e9
     print(
         f"[mem] {label}: process RSS={rss:.2f} GiB, system available={avail:.2f} GiB", flush=True)
+
+
+def _node_codes(cols):
+    """Map node-label columns onto one shared integer index.
+
+    Goes through the categorical codes when available so that millions of
+    label strings are never materialized (this runs while X_train is resident).
+    Returns (list of code arrays, n_nodes).
+    """
+    cats = [c.cat.categories if hasattr(c, 'cat') else pd.Index(pd.unique(c))
+            for c in cols]
+    nodes = cats[0]
+    for c in cats[1:]:
+        nodes = nodes.union(c)
+    out = []
+    for c in cols:
+        if hasattr(c, 'cat'):
+            out.append(nodes.get_indexer(c.cat.categories)[c.cat.codes.to_numpy()])
+        else:
+            out.append(nodes.get_indexer(c))
+    return out, len(nodes)
+
+
+def _dyadic_cov(res, node_a, node_b, n_nodes, chunk_size=200_000):
+    """Dyadic-robust sandwich covariance (Fafchamps-Gubert; Aronow-Samii-Assenova).
+
+    Any two rows sharing an endpoint are treated as correlated. Two-way
+    clustering on (NODE_A, NODE_B) can't express this: the graph is undirected,
+    so a node sits in either column and cross-column pairs get counted as
+    independent.
+
+    With s_d = (y_d - p_d) x_d the score of row d, and G_i the score sum over
+    rows touching node i:
+
+        meat = sum_i G_i G_i^T - sum_d s_d s_d^T
+
+    sum_i G_i G_i^T weights each row pair by its number of shared nodes; two
+    distinct dyads share at most one, and a dyad shares two with itself, so
+    subtracting the row-wise outer products removes the diagonal double count.
+    Assumes one row per unordered pair.
+
+    Chunked because the full n x k score matrix is ~7 GiB at this scale.
+    """
+    X, y = res.model.exog, res.model.endog
+    n, k = X.shape
+    p = res.predict()
+    G = np.zeros((n_nodes, k))
+    S2 = np.zeros((k, k))
+    for lo in range(0, n, chunk_size):
+        hi = min(lo + chunk_size, n)
+        s = (y[lo:hi] - p[lo:hi])[:, None] * X[lo:hi]
+        S2 += s.T @ s
+        m = hi - lo
+        rows = np.arange(m)
+        # (m x n_nodes) incidence: one entry per endpoint, so each row's score
+        # lands in both of its nodes' sums
+        inc = csr_matrix((np.ones(2 * m),
+                          (np.concatenate([rows, rows]),
+                           np.concatenate([node_a[lo:hi], node_b[lo:hi]]))),
+                         shape=(m, n_nodes))
+        G += inc.T @ s
+    bread = np.asarray(res.normalized_cov_params)
+    return bread @ (G.T @ G - S2) @ bread
 
 
 def _chunked_logit_hessian(self, params, chunk_size=500_000):
@@ -872,6 +936,12 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
             min(#strong, #weak) per bin, so distance carries no marginal signal
             about strength. If a class empties out after matching,
             str_auc is nan. Default False.
+        dyadic_se : bool, optional
+            Swap the link model's nonrobust covariance for a dyadic-robust
+            sandwich, so bse/pvalues/conf_int account for rows sharing an
+            endpoint. Nonrobust SEs are badly anti-conservative here
+            (~7x too small, 75% false-positive rate at nominal 5%).
+            Default False.
 
     Returns
     -------
@@ -905,6 +975,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     directed = kwargs.get('directed', False)
     strength = kwargs.get('strength', None)
     strength_dist_control = kwargs.get('strength_dist_control', True)
+    dyadic_se = kwargs.get('dyadic_se', False)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1020,7 +1091,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
         train_edges, features, embedding_map, operator, cat_threshold, agg)
     _log_mem("after X_train_pos built")
-    X_train_neg, _, _ = build_feature_matrix(
+    X_train_neg, keep_train_neg, _ = build_feature_matrix(
         train_non_edges, features, embedding_map, operator, cat_threshold, agg)
     _log_mem("after X_train_neg built")
 
@@ -1108,6 +1179,30 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
 
     link_model = link_mod.fit(method='lbfgs', maxiter=200)
     _log_mem("after link_model.fit() returned")
+
+    if dyadic_se:
+        # node codes in X_train row order (train positives, then negatives)
+        (a_pos, a_neg, b_pos, b_neg), n_nodes = _node_codes([
+            train_edges['NODE_A'], train_non_edges['NODE_A'],
+            train_edges['NODE_B'], train_non_edges['NODE_B']])
+        ia = np.concatenate([a_pos[keep_train_pos], a_neg[keep_train_neg]])
+        ib = np.concatenate([b_pos[keep_train_pos], b_neg[keep_train_neg]])
+        tgt = getattr(link_model, '_results', link_model)
+        # read the nonrobust SEs off normalized_cov_params rather than .bse:
+        # .bse is cache_readonly, and touching it first would freeze the
+        # nonrobust value in place and make the override below a no-op
+        bse_plain = np.sqrt(np.diag(np.asarray(tgt.normalized_cov_params)))
+        link_cov = _dyadic_cov(link_model, ia, ib, n_nodes)
+        # cov_params() honors cov_params_default, so bse/pvalues/conf_int and
+        # summary2 all pick this up; set it on _results, not the wrapper
+        tgt.cov_params_default = link_cov
+        tgt.cov_type = 'dyadic-robust'
+        for _k in ('bse', 'tvalues', 'pvalues'):
+            getattr(tgt, '_cache', {}).pop(_k, None)
+        print(f"Dyadic-robust SEs over {n_nodes} node clusters: "
+              f"median inflation x"
+              f"{np.median(np.asarray(link_model.bse) / bse_plain):.2f}")
+        _log_mem("after dyadic covariance")
 
     # print out description excluding embeddings, but keep the header block
     # (pseudo R-squared, log-likelihood, convergence) which tables[1] alone drops
@@ -1238,7 +1333,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
 
         if 'emb' in features:
             str_summary = str_model.summary2()
-            filt_summary = str_summary.tables[1].drop(index=emb_features)
+            filt_summary = str_summary.tables[1].drop(index=emb_vec_features)
             print(str_summary.tables[0])
             print(filt_summary)
         else:

@@ -5,11 +5,11 @@ Df Model,1.0
 Df Residuals,6930240.0
 Converged,True
 Iterations,7
-Covariance Type,nonrobust
-Log-Likelihood,-4526125.9294
+Covariance Type,dyadic-robust
+Log-Likelihood,-4524374.2383
 LL-Null (intercept only),-4803677.7029
-LLR chi2,555103.5469
+LLR chi2,558606.9291
 LLR p-value,0.0
-Pseudo R-squ. (McFadden's),0.0578
-AIC,9052255.8589
-BIC,9052283.3617
+Pseudo R-squ. (McFadden's),0.0581
+AIC,9048752.4766
+BIC,9048779.9795

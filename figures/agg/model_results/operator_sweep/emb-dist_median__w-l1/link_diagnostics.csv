@@ -4,12 +4,12 @@ No. Observations,6930242
 Df Model,129.0
 Df Residuals,6930112.0
 Converged,True
-Iterations,32
-Covariance Type,nonrobust
-Log-Likelihood,-3913401.2422
+Iterations,29
+Covariance Type,dyadic-robust
+Log-Likelihood,-3911228.8645
 LL-Null (intercept only),-4803677.7029
-LLR chi2,1780552.9215
+LLR chi2,1784897.6769
 LLR p-value,0.0
-Pseudo R-squ. (McFadden's),0.1853
-AIC,7827062.4843
-BIC,7828850.167
+Pseudo R-squ. (McFadden's),0.1858
+AIC,7822717.7289
+BIC,7824505.4116
