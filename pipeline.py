@@ -968,8 +968,8 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
-    # allow passing in precomputed embeddings
     cat_threshold = kwargs.get('cat_threshold', 1)
+    # allow passing in precomputed embeddings
     embedding_map = kwargs.get('embedding_map', None)
     # switch for weighted/directed version
     weighted = kwargs.get('weighted', False)
