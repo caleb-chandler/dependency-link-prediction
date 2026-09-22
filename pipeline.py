@@ -1181,7 +1181,7 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
               f"{np.median(np.asarray(link_model.bse) / bse_plain):.2f}")
         _log_mem("after dyadic covariance")
 
-    # print out description excluding embeddings, but keep the header block
+    # print out description excluding embeddings but keep the header block
     # (pseudo R-squared, log-likelihood, convergence) which tables[1] alone drops
     if 'emb' in features:
         link_summary = link_model.summary2()
@@ -1226,112 +1226,113 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
     print(f"[{feature_label}{op_label}]  Link AUC = {link_auc:.4f}")
 
     # ===== strength head =====
+
     # TODO: rebuild this as well whenever we use it
-    if strength:
-        # function to return dependencies of kept edges only
-        def _dep(edges, keep):
-            return np.array([G[u][v]['DEP'] for u, v in edges],
-                            dtype=np.float64)[keep]
+    # if strength:
+    #     # function to return dependencies of kept edges only
+    #     def _dep(edges, keep):
+    #         return np.array([G[u][v]['DEP'] for u, v in edges],
+    #                         dtype=np.float64)[keep]
 
-        # distance-controlled sampler (strength version)
-        def _dist_matched_idx(dep, dist, thr):
-            # same log bins as the link version, then keep min(#strong, #weak)
-            strong = dep > thr
-            if dist.max() > 0.01:
-                edges_b = np.concatenate(
-                    ([0], np.geomspace(0.01, dist.max(), 50)))
-            else:
-                edges_b = np.linspace(0, dist.max() + 1e-5, 50)
-            # indexes the bin that each edge falls into
-            b = np.digitize(dist, edges_b)
-            keep = []
-            for bin_id in np.unique(b):
-                # strong and weak within bin (returns indices)
-                in_bin = np.where(b == bin_id)[0]
-                s = in_bin[strong[in_bin]]
-                w = in_bin[~strong[in_bin]]
-                k = min(len(s), len(w))
-                if k == 0:
-                    continue
-                # select k random samples from within-bin subsets w/o replacement
-                # (smaller one technically just gets copied but its fast enough
-                # that the redundancy doesn't matter)
-                keep.extend(np.random.choice(s, k, replace=False))
-                keep.extend(np.random.choice(w, k, replace=False))
-            return np.sort(np.array(keep, dtype=int))
+    #     # distance-controlled sampler (strength version)
+    #     def _dist_matched_idx(dep, dist, thr):
+    #         # same log bins as the link version, then keep min(#strong, #weak)
+    #         strong = dep > thr
+    #         if dist.max() > 0.01:
+    #             edges_b = np.concatenate(
+    #                 ([0], np.geomspace(0.01, dist.max(), 50)))
+    #         else:
+    #             edges_b = np.linspace(0, dist.max() + 1e-5, 50)
+    #         # indexes the bin that each edge falls into
+    #         b = np.digitize(dist, edges_b)
+    #         keep = []
+    #         for bin_id in np.unique(b):
+    #             # strong and weak within bin (returns indices)
+    #             in_bin = np.where(b == bin_id)[0]
+    #             s = in_bin[strong[in_bin]]
+    #             w = in_bin[~strong[in_bin]]
+    #             k = min(len(s), len(w))
+    #             if k == 0:
+    #                 continue
+    #             # select k random samples from within-bin subsets w/o replacement
+    #             # (smaller one technically just gets copied but its fast enough
+    #             # that the redundancy doesn't matter)
+    #             keep.extend(np.random.choice(s, k, replace=False))
+    #             keep.extend(np.random.choice(w, k, replace=False))
+    #         return np.sort(np.array(keep, dtype=int))
 
-        dep_train = _dep(train_edges, keep_train_pos)
-        dep_test = _dep(test_edges, keep_test_pos)
+    #     dep_train = _dep(train_edges, keep_train_pos)
+    #     dep_test = _dep(test_edges, keep_test_pos)
 
-        thr = np.quantile(dep_train, strength)
-        y_str_train = (dep_train > thr).astype(int)
-        y_str_test = (dep_test > thr).astype(int)
+    #     thr = np.quantile(dep_train, strength)
+    #     y_str_train = (dep_train > thr).astype(int)
+    #     y_str_test = (dep_test > thr).astype(int)
 
-        if strength_dist_control:
-            idx_tr = _dist_matched_idx(
-                dep_train, edge_distances_km(
-                    G, [train_edges[i] for i in keep_train_pos]), thr)
-            idx_te = _dist_matched_idx(
-                dep_test, edge_distances_km(
-                    G, [test_edges[i] for i in keep_test_pos]), thr)
-            # filter to sampled edges
-            X_train_pos = X_train_pos[idx_tr]
-            X_test_pos = X_test_pos[idx_te]
-            y_str_train = y_str_train[idx_tr]
-            y_str_test = y_str_test[idx_te]
-            print(f"Distance-matched strength set: "
-                  f"train {len(idx_tr)}/{len(dep_train)}, "
-                  f"test {len(idx_te)}/{len(dep_test)} edges kept")
-            if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
-                print("Warning: a strength class vanished after distance "
-                      "matching — cannot score. Returning link results.")
-                return {'link_auc': link_auc,
-                        'link_model': link_model,
-                        'link_cm': link_cm,
-                        'embedding_map': embedding_map}
+    #     if strength_dist_control:
+    #         idx_tr = _dist_matched_idx(
+    #             dep_train, edge_distances_km(
+    #                 G, [train_edges[i] for i in keep_train_pos]), thr)
+    #         idx_te = _dist_matched_idx(
+    #             dep_test, edge_distances_km(
+    #                 G, [test_edges[i] for i in keep_test_pos]), thr)
+    #         # filter to sampled edges
+    #         X_train_pos = X_train_pos[idx_tr]
+    #         X_test_pos = X_test_pos[idx_te]
+    #         y_str_train = y_str_train[idx_tr]
+    #         y_str_test = y_str_test[idx_te]
+    #         print(f"Distance-matched strength set: "
+    #               f"train {len(idx_tr)}/{len(dep_train)}, "
+    #               f"test {len(idx_te)}/{len(dep_test)} edges kept")
+    #         if len(np.unique(y_str_test)) < 2 or len(np.unique(y_str_train)) < 2:
+    #             print("Warning: a strength class vanished after distance "
+    #                   "matching — cannot score. Returning link results.")
+    #             return {'link_auc': link_auc,
+    #                     'link_model': link_model,
+    #                     'link_cm': link_cm,
+    #                     'embedding_map': embedding_map}
 
-        # same float32 in-place standardization as before
-        X_train_pos = pd.DataFrame(X_train_pos, columns=feature_names)
-        if standardize:
-            X_train_pos, str_mean, str_std = standardizer(X_train_pos)
-            X_test_pos -= str_mean
-            X_test_pos /= str_std
+    #     # same float32 in-place standardization as before
+    #     X_train_pos = pd.DataFrame(X_train_pos, columns=feature_names)
+    #     if standardize:
+    #         X_train_pos, str_mean, str_std = standardizer(X_train_pos)
+    #         X_test_pos -= str_mean
+    #         X_test_pos /= str_std
 
-        X_train_pos = sm.add_constant(X_train_pos)
-        str_exog_names = ['const'] + feature_names
-        X_train_pos = X_train_pos.to_numpy(dtype=np.float64)
-        _log_mem(
-            "strength head: after consolidating to ndarray, before Logit(...) construction")
-        str_mod = sm.Logit(y_str_train, X_train_pos, check_rank=False)
-        str_mod.data.xnames = str_exog_names
-        _log_mem("strength head: after Logit(...) constructed, right before .fit()")
-        str_model = str_mod.fit(method='lbfgs', maxiter=200)
-        _log_mem("strength head: after str_model.fit() returned")
+    #     X_train_pos = sm.add_constant(X_train_pos)
+    #     str_exog_names = ['const'] + feature_names
+    #     X_train_pos = X_train_pos.to_numpy(dtype=np.float64)
+    #     _log_mem(
+    #         "strength head: after consolidating to ndarray, before Logit(...) construction")
+    #     str_mod = sm.Logit(y_str_train, X_train_pos, check_rank=False)
+    #     str_mod.data.xnames = str_exog_names
+    #     _log_mem("strength head: after Logit(...) constructed, right before .fit()")
+    #     str_model = str_mod.fit(method='lbfgs', maxiter=200)
+    #     _log_mem("strength head: after str_model.fit() returned")
 
-        if 'emb' in features:
-            str_summary = str_model.summary2()
-            filt_summary = str_summary.tables[1].drop(index=emb_vec_features)
-            print(str_summary.tables[0])
-            print(filt_summary)
-        else:
-            print(str_model.summary2())
+    #     if 'emb' in features:
+    #         str_summary = str_model.summary2()
+    #         filt_summary = str_summary.tables[1].drop(index=emb_vec_features)
+    #         print(str_summary.tables[0])
+    #         print(filt_summary)
+    #     else:
+    #         print(str_model.summary2())
 
-        X_test_pos = sm.add_constant(X_test_pos, has_constant='add')
-        str_probs = str_model.predict(X_test_pos)
-        str_preds = (str_probs >= 0.5).astype(int)
-        str_auc = roc_auc_score(y_str_test, str_probs)
-        str_cm = confusion_matrix(y_str_test, str_preds)
+    #     X_test_pos = sm.add_constant(X_test_pos, has_constant='add')
+    #     str_probs = str_model.predict(X_test_pos)
+    #     str_preds = (str_probs >= 0.5).astype(int)
+    #     str_auc = roc_auc_score(y_str_test, str_probs)
+    #     str_cm = confusion_matrix(y_str_test, str_preds)
 
-        print(f"[{feature_label}{op_label}]"
-              f"  Strength AUC = {str_auc:.4f}")
+    #     print(f"[{feature_label}{op_label}]"
+    #           f"  Strength AUC = {str_auc:.4f}")
 
-        return {'link_auc': link_auc,
-                'link_model': link_model,
-                'link_cm': link_cm,
-                'embedding_map': embedding_map,
-                'str_auc': str_auc,
-                'str_model': str_model,
-                'str_cm': str_cm}
+    #     return {'link_auc': link_auc,
+    #             'link_model': link_model,
+    #             'link_cm': link_cm,
+    #             'embedding_map': embedding_map,
+    #             'str_auc': str_auc,
+    #             'str_model': str_model,
+    #             'str_cm': str_cm}
 
     return {'link_auc': link_auc,
             'link_model': link_model,
