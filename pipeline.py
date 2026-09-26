@@ -493,8 +493,8 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
 
 
 def prepare_data(
-    pos_path, neg_path, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, meta=None,
-    trainfile='data/train.txt', controlled=True, n_bins=50, dist_type='mean'
+    pos_path, neg_path=None, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, metadata=None,
+    trainfile='data/train.txt'
 ):
     """
     Prepare data for link prediction pipeline.
@@ -509,13 +509,14 @@ def prepare_data(
     seed (int, optional): Seed for reproducibility.
     compress (int, optional): Option to log-compress weights when creating training graph
 
-    Returns:
-    file : file consisting of the positive training graph as an edgelist. saved to 'trainfile'
-    pd.DataFrame : negative training samples
-    pd.DataFrame : positive testing samples
-    pd.DataFrame : negative testing samples
+    If neg_path, returns:
+        file : file consisting of the positive training graph as an edgelist. saved to 'trainfile'
+        pd.DataFrame : negative training samples
+        pd.DataFrame : positive testing samples
+        pd.DataFrame : negative testing samples
+    Otherwise returns the same but no negatives.
     """
-    # TODO: finish rebuild + add compression functionality if needed again for some reason
+    # TODO: add functionality as needed
 
     # --- read in data ---
 
@@ -543,13 +544,17 @@ def prepare_data(
 
     print('Converting to nx.Graph for MST...')
     # add index as col
+    # TODO: add to attr dict as needed
+    attrs = {
+        ""
+    }
     edgelist = edgelist.reset_index()
     G = nx.from_pandas_edgelist(
         edgelist, 'NODE_A', 'NODE_B', edge_attr='index')
 
-    def split(edgelist, sign, frac=test_frac):
+    def split(edgelist, test_frac, sign):
         if sign == 'neg':
-            test = edgelist.sample(frac, random_state=seed)
+            test = edgelist.sample(frac=test_frac, random_state=seed)
             train = edgelist.drop(test.index)
             return train, test
 
@@ -558,7 +563,7 @@ def prepare_data(
         mst_idx = [d['index'] for _, _, d in
                    nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
         num_removable = len(edges) - len(mst_idx)
-        test_num = (frac) * len(edgelist)
+        test_num = (test_frac) * len(edgelist)
         if num_removable < test_num:
             raise SystemExit(
                 f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(num_removable)} available.)')
@@ -579,11 +584,12 @@ def prepare_data(
 
         return G_train, test
 
+    if neg_path:
+        G_train, test = split(G, test_frac, '')
+
     # extracting lcc in case disconnected
     largest_cc = max(nx.connected_components(G), key=len)
     G = G.subgraph(largest_cc).copy()
-
-    G_train, test_edges, test_non_edges, train_non_edges = split(G)
 
     if nx.is_empty(G_train):
         raise SystemExit("Error: Empty training graph.")
@@ -595,10 +601,11 @@ def prepare_data(
     print(
         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
 
-    if meta:
-        return G, train_non_edges, test_edges, test_non_edges
-    else:
-        return train_non_edges, test_edges, test_non_edges
+    if neg_path:
+        if metadata:
+            return G, train_non_edges, test_edges, test_non_edges
+        else:
+            return train_non_edges, test_edges, test_non_edges
 
 # ====================================================================
 
@@ -897,8 +904,8 @@ not needed:
 '''
 
 
-def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_edges, features=['emb'],
-                 standardize=False, mode='SparseOTF', operator='hadamard', agg=False, **kwargs):
+def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, test_non_edges, features=['emb'],
+                          standardize=False, mode='SparseOTF', operator='hadamard', agg=False, **kwargs):
     """
     Run the link prediction pipeline with flexible feature composition. Features controlled by `features` list.
 
@@ -1338,3 +1345,31 @@ def run_pipeline(trainfile, train_edges, train_non_edges, test_edges, test_non_e
             'link_model': link_model,
             'link_cm': link_cm,
             'embedding_map': embedding_map}
+
+
+def run_pipeline_linear(trainfile, edgelist, test_frac=0.5, **kwargs):
+    '''
+    1. embeddings
+    2. features (y is covisit vals)
+    3. train model
+    4. return model + wtv else
+    '''
+    # === kwargs ===
+    # TODO
+
+    # seed
+    seed = kwargs.get('seed', None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
+    else:
+        print("Notice: seed not passed.")
+
+    # split out train/test (no pos/neg this time)
+    test = edgelist.sample(frac=test_frac, random_state=seed)
+    train = edgelist.drop(test.index)
+
+    # ensure training graph is fully connected
+    G = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
+    assert nx.is_connected(G), 'Error: disconnected training graph.'
