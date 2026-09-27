@@ -1247,6 +1247,12 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     # create confusion matrix "in-house"
     link_cm = confusion_matrix(y_test, link_preds)
 
+    # match predictions to edges
+    pred_df = np.vstack([test_edges, test_non_edges])
+    pred_df['LABEL'] = y_test
+    pred_df['PROB'] = link_probs
+    pred_df['PRED'] = link_preds
+
     # --- report ---
     feature_label = '+'.join(features)
     op_label = f" ({operator})" if 'emb' in features else ""
@@ -1364,11 +1370,12 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     return {'link_auc': link_auc,
             'link_model': link_model,
             'link_cm': link_cm,
-            'embedding_map': embedding_map}
+            'embedding_map': embedding_map,
+            'pred_df': pred_df}
 
 
-def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress=True,
-                        mode='SparseOTF', operator=None, embedding_map=None, standardize=False, **kwargs):
+def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='SparseOTF',
+                        operator=None, embedding_map=None, standardize=False, **kwargs):
     '''
     1. embeddings
     2. features (y is covisit vals)
@@ -1387,7 +1394,6 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress
     walk_length = kwargs.get('walk_length', 80)
     window_size = kwargs.get('window_size', 10)
     epochs = kwargs.get('epochs', 1)
-    # switch for weighted/directed version
     weighted = kwargs.get('weighted', False)
     directed = kwargs.get('directed', False)
 
@@ -1406,11 +1412,6 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress
     # TODO: update
     if features == 'all' or features == ['all']:
         features = ['emb', 'dist', 'cat', 'cbg', 'comm', 'time', 'income']
-
-    # dynamically adjust metadata bool
-    non_meta = ['emb', 'dist_mean', 'dist_median',
-                'dist_min', 'dist_centroid', 'cosine']
-    metadata_bool = any(f not in non_meta for f in features)
 
     if any(f in features for f in ('emb', 'cosine')):
         assert operator, "Error: binary operator must be selected if using embeddings."
@@ -1517,30 +1518,43 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress
         X_test -= train_mean
         X_test /= train_std
 
-    # convert Xs to df for feature names and standardization gates
-    X_train = pd.DataFrame(X_train, columns=feature_names)
-
     print(
         f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
 
     # ===== Train =====
 
     # add constant and fit model
-    X_train = X_train.to_numpy(dtype=np.float32)
     X_train = sm.add_constant(X_train)
     exog_names = ['const'] + feature_names
 
     mod = sm.OLS(y_train, X_train)
     mod.data.xnames[:] = exog_names
 
-    model = mod.fit(method='lbfgs', maxiter=200)
+    model = mod.fit(method='pinv', maxiter=200)
 
     # account for dependence between edges sharing nodes
-    all_data = pd.concat([train, test])
-    node_groups = all_data[['NODE_A', 'NODE_B']].to_numpy()
-    model_results = model.get_robustcov_results(
-        cov_type='cluster', groups=node_groups
-    )
+    # node codes in X_train row order (build_feature_matrix keeps every row)
+    (ia, ib), n_nodes = _node_codes([train['NODE_A'], train['NODE_B']])
+    tgt = getattr(model, '_results', model)
+    # read the nonrobust SEs off normalized_cov_params rather than .bse:
+    # .bse is cache_readonly, and touching it first would freeze the
+    # nonrobust value in place and make the override below a no-op.
+    # unlike logit, OLS nonrobust cov is normalized_cov_params * sigma^2
+    bse_plain = np.sqrt(
+        np.diag(np.asarray(tgt.normalized_cov_params) * tgt.scale))
+    dyad_cov = _dyadic_cov(model, ia, ib, n_nodes)
+    # cov_params() honors cov_params_default, so bse/pvalues/conf_int and
+    # summary2 all pick this up; set it on _results, not the wrapper.
+    # sigma^2 is already in the residuals inside the meat, so no rescaling
+    tgt.cov_params_default = dyad_cov
+    tgt.cov_type = 'dyadic-robust'
+    for _k in ('bse', 'tvalues', 'pvalues'):
+        getattr(tgt, '_cache', {}).pop(_k, None)
+    print(f"Dyadic-robust SEs over {n_nodes} node clusters: "
+          f"median inflation x"
+          f"{np.median(np.asarray(model.bse) / bse_plain):.2f}")
+    _log_mem("after dyadic covariance")
+    model_results = model
 
     # print out description excluding embeddings but keep the header block which tables[1] alone drops
     if 'emb' in features:
@@ -1555,8 +1569,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress
 
     # === Test ===
 
-    X_test = X_test.to_numpy(dtype=np.float32)
-    X_test = sm.add_constant(X_train)
+    X_test = sm.add_constant(X_test)
     y_pred = model.predict(X_test)
 
     rmse = root_mean_squared_error(y_test, y_pred)
@@ -1567,14 +1580,19 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress
     print(f"Test MAE: {mae}")
     print(f"Test R²:  {test_r2:.4f}")
 
-    residuals = y_test - y_pred
+    y_pred = pd.Series(y_pred, name="PRED")
+    residuals = (y_test - y_pred).rename("RESID")
+
+    # match predictions and residuals to corresponding edges
+    pred_df = pd.concat([test, y_pred, residuals], axis=1)
 
     pred_results = {
-        "RMSE": rmse,
-        "MAE": mae,
-        "Test R2": test_r2,
-        "Residuals": residuals,
-        "Predictions": y_pred
+        "rmse": rmse,
+        "mae": mae,
+        "test_r2": test_r2,
+        "pred_df": pred_df
     }
 
-    return model_results, embedding_map, pred_results
+    return {"model results": model_results,
+            "embedding_map": embedding_map,
+            "pred_results": pred_results}
