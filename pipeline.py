@@ -493,7 +493,7 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
 
 
 def prepare_data(
-    _path, logistic=False, test_frac=0.5, seed=None, compress=True, weight=None, metadata=None, write=True,
+    _path, logistic=False, test_frac=0.5, seed=None, compress=True, weight=None, metadata=False, write=True,
     trainfile='data/train.txt'
 ):
     """
@@ -613,14 +613,18 @@ def prepare_data(
                         f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
                 else:
                     print('Overwrite skipped; using existing training graph.')
+    else:
+        print("Error: Logistic branch incomplete")
+        return None
 
-        if metadata:
-            return G, train, test
+    if metadata:
+        print("Error: Metadata branch incomplete")
+        return None
 
-        return train, test
+    return {'train': train, 'test': test}
 
-        # TODO: add functionality for logistic if needed
-        # return G_train, train_neg, test_pos, test_neg
+    # TODO: add functionality for logistic if needed
+    # return G_train, train_neg, test_pos, test_neg
 
 # ====================================================================
 
@@ -1363,7 +1367,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             'embedding_map': embedding_map}
 
 
-def run_pipeline_linear(trainfile, fpath, features, test_frac=0.5, weight='cov', compress=True,
+def run_pipeline_linear(trainfile, train, test, features, weight='cov', compress=True,
                         mode='SparseOTF', operator=None, embedding_map=None, standardize=False, **kwargs):
     '''
     1. embeddings
@@ -1410,17 +1414,6 @@ def run_pipeline_linear(trainfile, fpath, features, test_frac=0.5, weight='cov',
 
     if any(f in features for f in ('emb', 'cosine')):
         assert operator, "Error: binary operator must be selected if using embeddings."
-
-    # split out train/test + write training graph (no pos/neg this time)
-    train, test = prepare_data(
-        fpath,
-        test_frac=test_frac,
-        seed=seed,
-        compress=compress,
-        weight=weight,
-        metadata=metadata_bool,
-        trainfile=trainfile
-    )
 
     # ensure training graph is fully connected
     G = nx.from_pandas_edgelist(trainfile, 'NODE_A', 'NODE_B')
