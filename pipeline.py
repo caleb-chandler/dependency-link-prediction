@@ -14,6 +14,8 @@ import statsmodels.api as sm
 import pickle
 import psutil
 import os
+from sklearn.metrics import root_mean_squared_error, mean_absolute_error, r2_score
+from pathlib import Path
 
 
 def _log_mem(label):
@@ -294,7 +296,6 @@ def load(fpath, compress=False):
     print(f"Edges: {G.number_of_edges()}")
     return G
 
-
 # ================================================================
 # DISTANCE-CONTROLLED SAMPLING
 # ================================================================
@@ -486,28 +487,24 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
     # return the raw edges as a list (bins have served their purpose)
     return [edge for bucket in bin_results for edge in bucket]
 
-
 # ====================================================================
 # PREPARE_DATA
 # ====================================================================
 
 
 def prepare_data(
-    pos_path, neg_path=None, test_frac=0.5, seed=None, agg=True, compress=0, weight=None, metadata=None,
+    _path, logistic=False, test_frac=0.5, seed=None, compress=True, weight=None, metadata=None, write=True,
     trainfile='data/train.txt'
 ):
     """
-    Prepare data for link prediction pipeline.
-
-    This function loads two sets of positive and negative edges respectively, splits them into 
-    training and testing sets, saves the resulting training graph, and outputs negative training edges,
-    negative test edges, and positive test edges, along with their attrs, as DataFrames.
+    1) splits data into train and test sets
+    2) writes training graph for node2vec
 
     Parameters:
-    pos_path and neg_path (str): Paths to the graph files. Must be readable as edgelists.
+    _path (str): Path to the graph file. Must be readable as edgelist.
     test_frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
     seed (int, optional): Seed for reproducibility.
-    compress (int, optional): Option to log-compress weights when creating training graph
+    compress (int, optional): Option to log-transform weights when creating training graph
 
     If neg_path, returns:
         file : file consisting of the positive training graph as an edgelist. saved to 'trainfile'
@@ -517,8 +514,19 @@ def prepare_data(
     Otherwise returns the same but no negatives.
     """
     # TODO: add functionality as needed
+    # - extra graph attrs
+    # - logistic path if using again
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
     # --- read in data ---
+
+    def fast_read_csv(fpath, _dtypes):
+        headers = pd.read_csv(fpath, nrows=0).columns
+        _dtypes = {col: dt for col, dt in _dtypes.items() if col in headers}
+        return pd.read_csv(fpath, dtype=_dtypes)
 
     # downcast for better performance
     _dtypes = {
@@ -530,14 +538,7 @@ def prepare_data(
         'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
         'N_VISITS_B': 'float32', 'DEP': 'float32'
     }
-
-    def fast_read_csv(fpath):
-        headers = pd.read_csv(fpath, nrows=0).columns
-        _dtypes = {col: 'float32' for col in headers}
-
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
+    edgelist = fast_read_csv(_path, _dtypes)
 
     capweight = 'DEP' if weight == 'dep' else (
         'N_COVISITS' if weight == 'cov' else None)
@@ -545,29 +546,28 @@ def prepare_data(
     print('Converting to nx.Graph for MST...')
     # add index as col
     # TODO: add to attr dict as needed
-    attrs = {
-        ""
-    }
+    # attrs = {
+    #     ""
+    # }
     edgelist = edgelist.reset_index()
-    G = nx.from_pandas_edgelist(
-        edgelist, 'NODE_A', 'NODE_B', edge_attr='index')
+    if weight:
+        G = nx.from_pandas_edgelist(
+            edgelist, 'NODE_A', 'NODE_B', edge_attr=['index', capweight])
+    else:
+        G = nx.from_pandas_edgelist(
+            edgelist, 'NODE_A', 'NODE_B', edge_attr='index')
 
-    def split(edgelist, test_frac, sign):
-        if sign == 'neg':
-            test = edgelist.sample(frac=test_frac, random_state=seed)
-            train = edgelist.drop(test.index)
-            return train, test
+    # use nx.Graph to find mst edges, then go back to df and sample while excluding them
+    edges = {tuple(sorted(e)) for e in G.edges()}
+    mst_idx = [d['index'] for _, _, d in
+               nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
+    num_removable = len(edges) - len(mst_idx)
+    test_num = (test_frac) * len(edgelist)
+    if num_removable < test_num:
+        raise SystemExit(
+            f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(num_removable)} available.)')
 
-        # if pos then use nx.Graph to find mst edges, then go back to df and sample while excluding them
-        edges = {tuple(sorted(e)) for e in G.edges()}
-        mst_idx = [d['index'] for _, _, d in
-                   nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
-        num_removable = len(edges) - len(mst_idx)
-        test_num = (test_frac) * len(edgelist)
-        if num_removable < test_num:
-            raise SystemExit(
-                f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(num_removable)} available.)')
-
+    if not logistic:
         # apply back to df
         edgelist_safe = edgelist.drop(index=mst_idx)
         # sample the same amount from edgelist_safe as would be needed to sample frac from original
@@ -575,37 +575,52 @@ def prepare_data(
             n=int(round(test_num)), random_state=seed)
         train = edgelist.drop(test.index)
 
-        # build training graph
-        if weight:
-            G_train = nx.from_pandas_edgelist(
-                train, 'NODE_A', 'NODE_B', edge_attr=capweight)
-        else:
-            G_train = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
+        # --- build + write training graph ---
 
-        return G_train, test
+        if write:
+            # TODO: dont forget to include attr dict here as well
+            if weight:
+                G_train = nx.from_pandas_edgelist(
+                    train, 'NODE_A', 'NODE_B', edge_attr=capweight)
+                for u, v, data in G_train.edges(data=True):
+                    wgt_val = data.pop(capweight)
+                    if compress:
+                        data['weight'] = np.log1p(
+                            wgt_val) if wgt_val > 0 else 0
+                    else:
+                        data['weight'] = wgt_val
+            else:
+                G_train = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
 
-    if neg_path:
-        G_train, test = split(G, test_frac, '')
+            if nx.is_empty(G_train):
+                raise SystemExit("Error: Empty training graph.")
 
-    # extracting lcc in case disconnected
-    largest_cc = max(nx.connected_components(G), key=len)
-    G = G.subgraph(largest_cc).copy()
+            # saving training graph
+            trainfile = Path(trainfile)
+            if not trainfile.is_file():
+                with open(trainfile, 'w') as f:
+                    for u, v, d in G_train.edges(data=True):
+                        f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
+                print(
+                    f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
+            else:
+                _overwrite = input("Trainfile already exists. Overwrite? Y/N")
+                if _overwrite == 'y' or _overwrite == 'Y':
+                    with open(trainfile, 'w') as f:
+                        for u, v, d in G_train.edges(data=True):
+                            f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
+                    print(
+                        f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
+                else:
+                    print('Overwrite skipped; using existing training graph.')
 
-    if nx.is_empty(G_train):
-        raise SystemExit("Error: Empty training graph.")
-
-    # saving training graph
-    with open(trainfile, 'w') as f:
-        for u, v, d in G_train.edges(data=True):
-            f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
-    print(
-        f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
-
-    if neg_path:
         if metadata:
-            return G, train_non_edges, test_edges, test_non_edges
-        else:
-            return train_non_edges, test_edges, test_non_edges
+            return G, train, test
+
+        return train, test
+
+        # TODO: add functionality for logistic if needed
+        # return G_train, train_neg, test_pos, test_neg
 
 # ====================================================================
 
@@ -965,6 +980,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         Trained model for later analysis.
     """
     # === unpacking kwargs ===
+
     # hyperparameters
     p = kwargs.get('p', 1)
     q = kwargs.get('q', 1)
@@ -1347,15 +1363,29 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             'embedding_map': embedding_map}
 
 
-def run_pipeline_linear(trainfile, edgelist, test_frac=0.5, **kwargs):
+def run_pipeline_linear(trainfile, fpath, features, test_frac=0.5, weight='cov', compress=True,
+                        mode='SparseOTF', operator=None, embedding_map=None, standardize=False, **kwargs):
     '''
     1. embeddings
     2. features (y is covisit vals)
     3. train model
     4. return model + wtv else
     '''
-    # === kwargs ===
-    # TODO
+    # === unpacking kwargs ===
+
+    # hyperparameters
+    p = kwargs.get('p', 1)
+    q = kwargs.get('q', 1)
+    workers = kwargs.get('workers', 6)
+    verbose = kwargs.get('verbose', True)
+    dim = kwargs.get('dim', 128)
+    num_walks = kwargs.get('num_walks', 10)
+    walk_length = kwargs.get('walk_length', 80)
+    window_size = kwargs.get('window_size', 10)
+    epochs = kwargs.get('epochs', 1)
+    # switch for weighted/directed version
+    weighted = kwargs.get('weighted', False)
+    directed = kwargs.get('directed', False)
 
     # seed
     seed = kwargs.get('seed', None)
@@ -1366,10 +1396,192 @@ def run_pipeline_linear(trainfile, edgelist, test_frac=0.5, **kwargs):
     else:
         print("Notice: seed not passed.")
 
-    # split out train/test (no pos/neg this time)
-    test = edgelist.sample(frac=test_frac, random_state=seed)
-    train = edgelist.drop(test.index)
+    capweight = 'DEP' if weight == 'dep' else (
+        'N_COVISITS' if weight == 'cov' else None)
+
+    # TODO: update
+    if features == 'all' or features == ['all']:
+        features = ['emb', 'dist', 'cat', 'cbg', 'comm', 'time', 'income']
+
+    # dynamically adjust metadata bool
+    non_meta = ['emb', 'dist_mean', 'dist_median',
+                'dist_min', 'dist_centroid', 'cosine']
+    metadata_bool = any(f not in non_meta for f in features)
+
+    if any(f in features for f in ('emb', 'cosine')):
+        assert operator, "Error: binary operator must be selected if using embeddings."
+
+    # split out train/test + write training graph (no pos/neg this time)
+    train, test = prepare_data(
+        fpath,
+        test_frac=test_frac,
+        seed=seed,
+        compress=compress,
+        weight=weight,
+        metadata=metadata_bool,
+        trainfile=trainfile
+    )
 
     # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
+    G = nx.from_pandas_edgelist(trainfile, 'NODE_A', 'NODE_B')
     assert nx.is_connected(G), 'Error: disconnected training graph.'
+
+    # ===== Embedding generation (only if needed) =====
+
+    if any(f in features for f in ('emb', 'cosine')) and embedding_map is not None:
+        print(f"Using precomputed embeddings: {len(embedding_map)} nodes")
+
+    elif any(f in features for f in ('emb', 'cosine')):
+        def make_pecanpy_graph(chosen_mode, w_bool):
+            if chosen_mode == 'PreComp':
+                return n2v.PreComp(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
+            elif chosen_mode == 'SparseOTF':
+                return n2v.SparseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
+            elif chosen_mode == 'DenseOTF':
+                return n2v.DenseOTF(p=p, q=q, workers=workers, verbose=verbose, extend=w_bool, random_state=seed)
+            else:
+                raise ValueError(f"Unknown pecanpy mode: {chosen_mode}")
+
+        # set an order in which to try modes
+        modes_to_try = [mode]
+        if mode != 'PreComp':
+            modes_to_try.append('PreComp')
+        if mode not in ['SparseOTF', 'DenseOTF']:
+            modes_to_try.append('DenseOTF')
+        # PreComp alias_indptr overflows uint32 for large weighted graphs;
+        # SparseOTF computes transition probs on-the-fly and avoids this
+        # insert() puts it at the front of the queue if it isnt already
+        if weighted and 'SparseOTF' not in modes_to_try:
+            modes_to_try.insert(0, 'SparseOTF')
+
+        last_exception = None
+        for candidate_mode in modes_to_try:
+            try:
+                g = make_pecanpy_graph(candidate_mode, weighted)
+                g.read_edg(trainfile, weighted=weighted,
+                           directed=directed, delimiter='\t')
+                if candidate_mode == 'PreComp':
+                    g.preprocess_transition_probs()
+
+                embeddings = g.embed(
+                    dim=dim, num_walks=num_walks,
+                    walk_length=walk_length, window_size=window_size,
+                    epochs=epochs, verbose=verbose,
+                )
+
+                if candidate_mode != mode:
+                    print(f"Notice: fell back to '{candidate_mode}'")
+                break
+            except Exception as e:
+                print(f"Notice: pecanpy mode '{candidate_mode}' failed: {e}")
+                last_exception = e
+                continue
+        else:
+            raise RuntimeError(
+                f"Pecanpy walk generation failed for all modes."
+            ) from last_exception
+
+        # convert to EmbeddingMap object
+        embedding_map = EmbeddingMap.from_pecanpy(g.nodes, embeddings)
+
+        print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
+
+    # ===== Assemble feature matrices =====
+
+    X_train, keep_train, feature_names = build_feature_matrix(
+        train, features, embedding_map, operator)
+    y_train = train[capweight]
+
+    X_test, keep_test, _ = build_feature_matrix(
+        test, features, embedding_map, operator)
+    y_test = test[capweight]
+
+    if standardize:
+        def standardizer(train_set):
+            ''' 
+            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+            Stats are accumulated in float64 for numerical stability, then cast back.
+            '''
+            # exclude dummy variables from standardization
+            # (mask if vals are only in set of 0 and 1)
+            dummies = np.isin(train_set, [0, 1]).all(axis=0)
+
+            train_mean = train_set.mean(
+                axis=0, dtype=np.float64).astype(np.float32)
+            train_std = train_set.std(
+                axis=0, dtype=np.float64).astype(np.float32)
+
+            # identity for subtraction and division respectively
+            # also ensure 0s dont enter into std dev for div by zero
+            train_mean[dummies] = 0.0
+            train_std[dummies] = 1.0
+            train_std[train_std == 0] = 1.0
+            train_set -= train_mean
+            train_set /= train_std
+
+            return train_set, train_mean, train_std
+        X_train, train_mean, train_std = standardizer(X_train)
+        X_test -= train_mean
+        X_test /= train_std
+
+    # convert Xs to df for feature names and standardization gates
+    X_train = pd.DataFrame(X_train, columns=feature_names)
+
+    print(
+        f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
+
+    # ===== Train =====
+
+    # add constant and fit model
+    X_train = X_train.to_numpy(dtype=np.float32)
+    X_train = sm.add_constant(X_train)
+    exog_names = ['const'] + feature_names
+
+    mod = sm.OLS(y_train, X_train)
+    mod.data.xnames[:] = exog_names
+
+    model = mod.fit(method='lbfgs', maxiter=200)
+
+    # account for dependence between edges sharing nodes
+    all_data = pd.concat([train, test])
+    node_groups = all_data[['NODE_A', 'NODE_B']].to_numpy()
+    model_results = model.get_robustcov_results(
+        cov_type='cluster', groups=node_groups
+    )
+
+    # print out description excluding embeddings but keep the header block which tables[1] alone drops
+    if 'emb' in features:
+        summary = model_results.summary2()
+        emb_vec_features = [
+            name for name in feature_names if name.startswith('emb_') and not 'cosine' in name]
+        filt_summary = summary.tables[1].drop(index=emb_vec_features)
+        print(summary.tables[0])
+        print(filt_summary)
+    else:
+        print(model_results.summary2())
+
+    # === Test ===
+
+    X_test = X_test.to_numpy(dtype=np.float32)
+    X_test = sm.add_constant(X_train)
+    y_pred = model.predict(X_test)
+
+    rmse = root_mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    test_r2 = r2_score(y_test, y_pred)
+
+    print(f"Test RMSE: {rmse}")
+    print(f"Test MAE: {mae}")
+    print(f"Test R²:  {test_r2:.4f}")
+
+    residuals = y_test - y_pred
+
+    pred_results = {
+        "RMSE": rmse,
+        "MAE": mae,
+        "Test R2": test_r2,
+        "Residuals": residuals,
+        "Predictions": y_pred
+    }
+
+    return model_results, embedding_map, pred_results
