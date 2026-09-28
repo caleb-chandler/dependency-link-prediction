@@ -584,7 +584,7 @@ def prepare_data(
             # TODO: dont forget to include attr dict here as well
             if weight:
                 G_train = nx.from_pandas_edgelist(
-                    train, 'NODE_A', 'NODE_B', edge_attr=capweight)
+                    train, 'NODE_A', 'NODE_B', edge_attr='LOG_'+capweight if compress else capweight)
                 for u, v, data in G_train.edges(data=True):
                     if compress:
                         wgt_val = data.pop('LOG_'+capweight)
@@ -1429,7 +1429,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
         assert operator, "Error: binary operator must be selected if using embeddings."
 
     # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(trainfile, 'NODE_A', 'NODE_B')
+    G = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
     assert nx.is_connected(G), 'Error: disconnected training graph.'
 
     # ===== Embedding generation (only if needed) =====
