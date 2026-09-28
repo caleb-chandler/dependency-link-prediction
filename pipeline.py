@@ -16,6 +16,7 @@ import psutil
 import os
 from sklearn.metrics import root_mean_squared_error, mean_absolute_error, r2_score
 from pathlib import Path
+from pandas.api.types import union_categoricals
 
 
 def _log_mem(label):
@@ -521,6 +522,9 @@ def prepare_data(
         random.seed(seed)
         np.random.seed(seed)
 
+    capweight = 'DEP' if weight == 'dep' else (
+        'N_COVISITS' if weight == 'cov' else None)
+
     # --- read in data ---
 
     def fast_read_csv(fpath, _dtypes):
@@ -539,9 +543,8 @@ def prepare_data(
         'N_VISITS_B': 'float32', 'DEP': 'float32'
     }
     edgelist = fast_read_csv(_path, _dtypes)
-
-    capweight = 'DEP' if weight == 'dep' else (
-        'N_COVISITS' if weight == 'cov' else None)
+    if compress:
+        edgelist['LOG_'+capweight] = np.log1p(edgelist[capweight])
 
     print('Converting to nx.Graph for MST...')
     # add index as col
@@ -583,11 +586,11 @@ def prepare_data(
                 G_train = nx.from_pandas_edgelist(
                     train, 'NODE_A', 'NODE_B', edge_attr=capweight)
                 for u, v, data in G_train.edges(data=True):
-                    wgt_val = data.pop(capweight)
                     if compress:
-                        data['weight'] = np.log1p(
-                            wgt_val) if wgt_val > 0 else 0
+                        wgt_val = data.pop('LOG_'+capweight)
+                        data['weight'] = wgt_val
                     else:
+                        wgt_val = data.pop(capweight)
                         data['weight'] = wgt_val
             else:
                 G_train = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
@@ -605,7 +608,7 @@ def prepare_data(
                     f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
             else:
                 _overwrite = input("Trainfile already exists. Overwrite? Y/N")
-                if _overwrite == 'y' or _overwrite == 'Y':
+                if (_overwrite == 'y' or _overwrite == 'Y'):
                     with open(trainfile, 'w') as f:
                         for u, v, d in G_train.edges(data=True):
                             f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
@@ -1252,10 +1255,15 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     link_cm = confusion_matrix(y_test, link_preds)
 
     # match predictions to edges
-    pred_df = np.vstack([test_edges, test_non_edges])
+    pred_df = pd.concat([test_edges, test_non_edges],
+                        join='inner', ignore_index=True)
     pred_df['LABEL'] = y_test
     pred_df['PROB'] = link_probs
     pred_df['PRED'] = link_preds
+    # convert back to categories for lower memory usage
+    for col in ('NODE_A', 'NODE_B'):
+        pred_df[col] = union_categoricals(
+            [test_edges[col], test_non_edges[col]])
 
     # --- report ---
     feature_label = '+'.join(features)
@@ -1379,7 +1387,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
 
 def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='SparseOTF',
-                        operator=None, embedding_map=None, standardize=False, **kwargs):
+                        operator=None, embedding_map=None, standardize=False, compressed=True, **kwargs):
     '''
     1. embeddings
     2. features (y is covisit vals)
@@ -1484,15 +1492,21 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
         print(f"Embeddings generated: {len(embedding_map)} nodes, dim={dim}")
 
-    # ===== Assemble feature matrices =====
+    # ===== assemble feature matrices =====
 
-    X_train, keep_train, feature_names = build_feature_matrix(
+    X_train, _, feature_names = build_feature_matrix(
         train, features, embedding_map, operator)
-    y_train = train[capweight]
+    if compressed:
+        y_train = train['LOG_'+capweight]
+    else:
+        y_train = train[capweight]
 
-    X_test, keep_test, _ = build_feature_matrix(
+    X_test, _, _ = build_feature_matrix(
         test, features, embedding_map, operator)
-    y_test = test[capweight]
+    if compressed:
+        y_test = test['LOG_'+capweight]
+    else:
+        y_test = test[capweight]
 
     if standardize:
         def standardizer(train_set):
@@ -1584,11 +1598,8 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     print(f"Test MAE: {mae}")
     print(f"Test R²:  {test_r2:.4f}")
 
-    y_pred = pd.Series(y_pred, name="PRED")
-    residuals = (y_test - y_pred).rename("RESID")
-
     # match predictions and residuals to corresponding edges
-    pred_df = pd.concat([test, y_pred, residuals], axis=1)
+    pred_df = test.assign(PRED=y_pred, RESID=y_test.to_numpy() - y_pred)
 
     pred_results = {
         "rmse": rmse,
@@ -1597,6 +1608,6 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
         "pred_df": pred_df
     }
 
-    return {"model results": model_results,
+    return {"model_results": model_results,
             "embedding_map": embedding_map,
             "pred_results": pred_results}
