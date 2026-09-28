@@ -769,7 +769,8 @@ def build_feature_matrix(
     by `features`, which is a list that can contain any combination of:
 
         'emb'       – binary-operator output on node2vec embeddings (128-d by default)
-        'dist'      - log geographic distance in km  (1-d)
+        'dist'      - log geographic distance in km. possible suffixes: _median, _mean, _min, _centroid
+        'latlon'    - adds 4 features: avg lat/lon of node A + avg lat/lon of node B.
         'cat'       – (N_edges, N_interactions) matrix with binary corresponding to interaction type
         'catsame'   - simplified same/different category feature for baseline comparison
         'cbg'       - binary for same/different census-block group
@@ -892,6 +893,9 @@ def build_feature_matrix(
         feature_blocks.append(
             np.nan_to_num(np.log1p(edges['DIST_KM_CENTROID'].to_numpy().reshape(-1, 1))))
         feature_names.append('log_dist_centroid')
+
+    if 'latlon' in features:
+        feature_blocks.append(edges[['']])
 
     if 'comm' in features:
         # TODO: fill in if using comm
@@ -1367,9 +1371,9 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     #             'str_model': str_model,
     #             'str_cm': str_cm}
 
-    return {'link_auc': link_auc,
-            'link_model': link_model,
-            'link_cm': link_cm,
+    return {'auc': link_auc,
+            'model': link_model,
+            'cm': link_cm,
             'embedding_map': embedding_map,
             'pred_df': pred_df}
 
