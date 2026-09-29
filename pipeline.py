@@ -189,11 +189,11 @@ sm.Logit.hessian = _chunked_logit_hessian
 class EmbeddingMap:
     """Memory-efficient node embedding store.
 
-    Takes embedding matrix and node list outputted by pecanpy and converts to 
-    float32 matrix plus node:row index dict. filters out None entries in the node 
+    Takes embedding matrix and node list outputted by pecanpy and converts to
+    float32 matrix plus node:row index dict. filters out None entries in the node
     list so that the matrix is smaller than the input embeddings array.
 
-    Allows for fancy indexing without creating an unnecessary memory-intensive 
+    Allows for fancy indexing without creating an unnecessary memory-intensive
     copy in float64 (which pecanpy doesn't make or need) via .rows() method.
     """
 
@@ -303,7 +303,7 @@ def load(fpath, compress=False):
 
 
 def distribution_finder(G, dist_type, n_bins):
-    ''' 
+    '''
     Finds distance distribution by binning and counting number of occurrences per bin.
 
     Returns distribution as pd.Series indexed by bin, as well as dict mapping nodes
@@ -809,8 +809,8 @@ def build_feature_matrix(
 
     # vectorized embeddings
     if any(f in features for f in ('emb', 'cosine')):
-        # extract to 2D arrays: shape (N_pairs, dim). one for each endpoint.
-        # fancy-index the packed matrix when available; fall back to per-key lookup when not.
+        # extract to 2D arrays: shape (N_pairs, dim). one for each endpoint
+        # fancy-index the packed matrix when available; fall back to per-key lookup when not
         if hasattr(embedding_map, 'rows'):
             emb_u = embedding_map.rows(U)
             emb_v = embedding_map.rows(V)
@@ -898,7 +898,9 @@ def build_feature_matrix(
         feature_names.append('log_dist_centroid')
 
     if 'latlon' in features:
-        feature_blocks.append(edges[['']])
+        feature_blocks.append(
+            edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']].to_numpy())
+        feature_names.extend(['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B'])
 
     if 'comm' in features:
         # TODO: fill in if using comm
@@ -923,7 +925,7 @@ def build_feature_matrix(
 # RUN_PIPELINE
 # ====================================================================
 
-''' 
+'''
 not needed:
 - G
 - likely some of the kwargs
@@ -1138,8 +1140,8 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
     if standardize:
         def standardizer(train_set):
-            ''' 
-            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+            '''
+            Bypasses StandardScaler float64 upcasting by z-scoring in place.
             Stats are accumulated in float64 for numerical stability, then cast back.
             '''
             # exclude dummy variables from standardization
@@ -1510,8 +1512,8 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
     if standardize:
         def standardizer(train_set):
-            ''' 
-            Bypasses StandardScaler float64 upcasting by z-scoring in place. 
+            '''
+            Bypasses StandardScaler float64 upcasting by z-scoring in place.
             Stats are accumulated in float64 for numerical stability, then cast back.
             '''
             # exclude dummy variables from standardization
@@ -1598,8 +1600,10 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     print(f"Test MAE: {mae}")
     print(f"Test R²:  {test_r2:.4f}")
 
-    # match predictions and residuals to corresponding edges
-    pred_df = test.assign(PRED=y_pred, RESID=y_test.to_numpy() - y_pred)
+    # match predictions and residuals to corresponding edges (drop redundant cols first)
+    test = test.drop(columns=test.filter(like=capweight).columns)
+    pred_df = test.assign(PRED=y_pred,
+                          RESID=y_test.to_numpy() - y_pred)
 
     pred_results = {
         "rmse": rmse,
