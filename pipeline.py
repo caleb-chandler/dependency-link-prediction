@@ -898,8 +898,15 @@ def build_feature_matrix(
         feature_names.append('log_dist_centroid')
 
     if 'latlon' in features:
+        # replace coords with z-scored versions to account for the boston
+        # metro being a small proportion of the whole earth
+        coord_cols = edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
+        coord_means = coord_cols.mean()
+        coord_stds = coord_cols.std()
+        std_coords = (coord_cols - coord_means) / coord_stds
+        edges[coord_cols] = std_coords
         feature_blocks.append(
-            edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']].to_numpy())
+            coord_cols.to_numpy())
         feature_names.extend(['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B'])
 
     if 'comm' in features:
