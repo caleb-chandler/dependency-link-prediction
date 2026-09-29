@@ -762,7 +762,7 @@ def edge_distances_km(G, edges):
 
 
 def build_feature_matrix(
-        edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False
+        edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False, z_score_stats=None
 ):
     """
     TODO: update this
@@ -828,57 +828,6 @@ def build_feature_matrix(
         feature_names.extend(
             f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
-    # TODO: fix if using POI-level again
-    # if not agg and any(x in features for x in ('cat', 'catsame', 'cbg')):
-    #     print('Make sure you remember to not standardize dummies')
-    #     if 'cat' in features:
-    #         # count each undirected type-pair across all edges in G
-    #         pair_counts = {}
-    #         for eu, ev in G.edges():
-    #             cu = G.nodes[eu].get('poi_type', 'Unknown')
-    #             cv = G.nodes[ev].get('poi_type', 'Unknown')
-    #             pair = tuple(sorted([cu, cv]))
-    #             pair_counts[pair] = pair_counts.get(pair, 0) + 1
-
-    #         # only pairs observed >= cat_threshold times, sorted for stable columns
-    #         vocab = sorted(p for p, cnt in pair_counts.items()
-    #                        if cnt >= cat_threshold)
-    #         print(
-    #             f'Number of kept pairs with threshold {cat_threshold}: {len(vocab)}/210 ({((len(vocab)/210)*100):.4f}%)')
-    #         pair_to_idx = {p: i for i, p in enumerate(vocab)}
-
-    #         cat_feat = np.zeros((len(U), len(vocab)))
-    #         for i, (u, v) in enumerate(zip(U, V)):
-    #             cu = G.nodes[u].get('poi_type', 'Unknown')
-    #             cv = G.nodes[v].get('poi_type', 'Unknown')
-    #             pair = tuple(sorted([cu, cv]))
-    #             idx = pair_to_idx.get(pair)
-    #             if idx is not None:
-    #                 cat_feat[i, idx] = 1.0
-
-    #         feature_blocks.append(cat_feat)
-    #         feature_names.extend(f'cat_{a}||{b}' for a, b in vocab)
-
-    #     if 'catsame' in features:
-    #         cat_u = np.array([G.nodes[u].get('poi_type', '') for u in U])
-    #         cat_v = np.array([G.nodes[v].get('poi_type', '') for v in V])
-
-    #         # boolean array comparison converted to floats: 1.0 for True, 0.0 for False
-    #         cat_feat = (cat_u == cat_v).astype(float).reshape(-1, 1)
-    #         feature_blocks.append(cat_feat)
-    #         feature_names.append('catsame')
-
-    #     if 'cbg' in features:
-    #         cbg_u = np.array([G.nodes[u].get('cbg', 'Unknown') for u in U])
-    #         cbg_v = np.array([G.nodes[v].get('cbg', 'Unknown') for v in V])
-    #         cbg_feat = ((cbg_u == cbg_v) & (cbg_u != 'Unknown')
-    #                     ).astype(float).reshape(-1, 1)
-    #         feature_blocks.append(cbg_feat)
-    #         feature_names.append('cbg_same')
-    # elif not agg:
-    #     print(
-    #         'Category and census-based features invalid for aggregated network. Skipping.')
-
     # vectorized geographic distance
     if 'dist_mean' in features:
         feature_blocks.append(np.nan_to_num(
@@ -901,12 +850,15 @@ def build_feature_matrix(
         # replace coords with z-scored versions to account for the boston
         # metro being a small proportion of the whole earth
         coord_cols = edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
-        coord_means = coord_cols.mean()
-        coord_stds = coord_cols.std()
-        std_coords = (coord_cols - coord_means) / coord_stds
-        edges[coord_cols] = std_coords
+        lats = coord_cols.iloc[:, [0, 2]]
+        lons = coord_cols.iloc[:, [1, 3]]
+        lat_means, lat_stds, lon_means, lon_stds = z_score_stats
+        std_coords = coord_cols.assign(
+            **{col: lambda x, c=col: (x[c]-lat_means) / lat_stds for col in lats},
+            **{col: lambda x, c=col: (x[c]-lon_means) / lon_stds for col in lons},
+        )
         feature_blocks.append(
-            coord_cols.to_numpy())
+            std_coords.to_numpy())
         feature_names.extend(['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B'])
 
     if 'comm' in features:
@@ -1124,6 +1076,23 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         # TODO: insert fixed node_to_comm
         pass
 
+    z_score_stats = None
+    if 'latlon' in features:
+        train_coord_cols = pd.concat([train_edges, train_non_edges])[
+            ['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
+
+        lats = train_coord_cols[['LAT_A', 'LAT_B']]
+        lats = lats.stack().reset_index(drop=True)
+        lons = train_coord_cols[['LNG_A', 'LNG_B']]
+        lons = lons.stack().reset_index(drop=True)
+
+        lat_means = lats.mean()
+        lat_stds = lats.std()
+        lon_means = lons.mean()
+        lon_stds = lons.std()
+
+        z_score_stats = (lat_means, lat_stds, lon_means, lon_stds)
+
     if not agg:
         # TODO: remove and rework if using POI-level again
         if ('cbg' in features or 'tract' in features):
@@ -1133,10 +1102,10 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
     _log_mem("before building train feature matrices")
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
-        train_edges, features, embedding_map, operator, cat_threshold, agg)
+        train_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
     _log_mem("after X_train_pos built")
     X_train_neg, keep_train_neg, _ = build_feature_matrix(
-        train_non_edges, features, embedding_map, operator, cat_threshold, agg)
+        train_non_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
     _log_mem("after X_train_neg built")
 
     X_train = np.vstack([X_train_pos, X_train_neg])
@@ -1239,9 +1208,9 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     # ===== Test =====
 
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
-        test_edges, features, embedding_map, operator, cat_threshold, agg)
+        test_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
     X_test_neg, _, _ = build_feature_matrix(
-        test_non_edges, features, embedding_map, operator, cat_threshold, agg)
+        test_non_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     X_test = sm.add_constant(X_test, has_constant='add')
@@ -1503,15 +1472,31 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
     # ===== assemble feature matrices =====
 
+    z_score_stats = None
+    if 'latlon' in features:
+        train_coord_cols = train[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
+
+        lats = train_coord_cols[['LAT_A', 'LAT_B']]
+        lats = lats.stack().reset_index(drop=True)
+        lons = train_coord_cols[['LNG_A', 'LNG_B']]
+        lons = lons.stack().reset_index(drop=True)
+
+        lat_means = lats.mean()
+        lat_stds = lats.std()
+        lon_means = lons.mean()
+        lon_stds = lons.std()
+
+        z_score_stats = (lat_means, lat_stds, lon_means, lon_stds)
+
     X_train, _, feature_names = build_feature_matrix(
-        train, features, embedding_map, operator)
+        train, features, embedding_map, operator, z_score_stats=z_score_stats)
     if compressed:
         y_train = train['LOG_'+capweight]
     else:
         y_train = train[capweight]
 
     X_test, _, _ = build_feature_matrix(
-        test, features, embedding_map, operator)
+        test, features, embedding_map, operator, z_score_stats=z_score_stats)
     if compressed:
         y_test = test['LOG_'+capweight]
     else:
