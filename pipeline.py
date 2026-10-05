@@ -662,26 +662,22 @@ BINARY_OPERATORS = {
 # ===================================================================
 
 
-def node_to_area(G, shapefile_path='data/geo/tl_2025_25_bg.shp'):
-    """Add 'cbg' + 'tract' attribute to each node in G via spatial join."""
-    nodes = list(G.nodes())
-    lats = [G.nodes[n].get('latitude', 0) for n in nodes]
-    lngs = [G.nodes[n].get('longitude', 0) for n in nodes]
+def tract_to_area(nodes, shapefile_paths=(
+        'data/geo/tl_2019_25_tract.shp', 'data/geo/tl_2019_33_tract.shp')):
+    """map POIs to their tracts' land area."""
 
-    poi_gdf = gpd.GeoDataFrame(
-        {'node_id': nodes},
-        geometry=[Point(lng, lat) for lng, lat in zip(lngs, lats)],
-        crs='EPSG:4326'
+    mass_file, nh_file = shapefile_paths
+    mass_tracts = gpd.read_file(
+        mass_file, columns=['GEOID', 'ALAND'], ignore_geometry=True)
+    mass_tracts['TRACT'] = mass_tracts['GEOID'].str[:11]
+    nh_tracts = gpd.read_file(
+        nh_file, columns=['GEOID', 'ALAND'], ignore_geometry=True)
+    nh_tracts['TRACT'] = nh_tracts['GEOID'].str[:11]
+    all_tract_areas = gpd.GeoDataFrame(
+        pd.concat([mass_tracts, nh_tracts]).drop(
+            columns='GEOID').set_index('TRACT')
     )
-
-    cbg_gdf = gpd.read_file(shapefile_path).to_crs('EPSG:4326')
-    joined = gpd.sjoin(poi_gdf, cbg_gdf, how='left', predicate='within')
-
-    for _, row in joined.iterrows():
-        geoid = row.get('GEOID')
-        geoid = geoid if pd.notna(geoid) else None
-        G.nodes[row['node_id']]['cbg'] = geoid if geoid else 'Unknown'
-        G.nodes[row['node_id']]['tract'] = geoid[:11] if geoid else 'Unknown'
+    return nodes.join(all_tract_areas)
 
 
 def node_to_comm(G):
@@ -761,8 +757,29 @@ def edge_distances_km(G, edges):
     return 6371.0088 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
 
+def edgelist_to_nodelist(df, names):
+    name_1, name_2 = names
+    orig_cols = [name_1] + [c for c in df.columns if c.endswith('_'+name_1)]
+    dest_cols = [name_2] + [c for c in df.columns if c.endswith('_'+name_2)]
+    orig = df[orig_cols]
+    dest = df[dest_cols]
+
+    def de_edgify(df, indicator):
+        col_names = df.columns.tolist()
+        mapper = {n: n.replace(indicator, '') for n in col_names}
+        indicator2 = indicator.replace('_', '')
+        mapper |= {indicator2: 'NODE'}
+        return df.rename(mapper, axis=1)
+
+    orig = de_edgify(orig, '_'+name_1)
+    dest = de_edgify(dest, '_'+name_2)
+
+    return pd.concat([orig, dest], ignore_index=True).drop_duplicates(subset='NODE')
+
+
 def build_feature_matrix(
-        edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False, z_score_stats=None
+        edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False,
+        z_score_stats=None, densities=None
 ):
     """
     TODO: update this
@@ -801,7 +818,11 @@ def build_feature_matrix(
     op_fn = BINARY_OPERATORS[operator]
 
     # unzip the edges into two parallel arrays of origins and destinations
-    U, V = edges['NODE_A'], edges['NODE_B']
+    if agg:
+        U, V = edges['NODE_A'], edges['NODE_B']
+    else:
+        U, V = edges['ORIGIN'], edges['DESTINATION']
+
     kept_indices = list(range(len(edges)))
 
     feature_blocks = []
@@ -828,52 +849,73 @@ def build_feature_matrix(
         feature_names.extend(
             f'emb_{operator}_{i}' for i in range(emb_feat.shape[1]))
 
-    # vectorized geographic distance
-    if 'dist_mean' in features:
-        feature_blocks.append(np.nan_to_num(
-            np.log1p(edges['DIST_KM_MEAN'].to_numpy().reshape(-1, 1))))
-        feature_names.append('log_dist_mean')
-    if 'dist_min' in features:
-        feature_blocks.append(np.nan_to_num(
-            np.log1p(edges['DIST_KM_MIN'].to_numpy().reshape(-1, 1))))
-        feature_names.append('log_dist_min')
-    if 'dist_median' in features:
-        feature_blocks.append(
-            np.nan_to_num(np.log1p(edges['DIST_KM_MEDIAN'].to_numpy().reshape(-1, 1))))
-        feature_names.append('log_dist_median')
-    if 'dist_centroid' in features:
-        feature_blocks.append(
-            np.nan_to_num(np.log1p(edges['DIST_KM_CENTROID'].to_numpy().reshape(-1, 1))))
-        feature_names.append('log_dist_centroid')
+    if agg:
+        # vectorized geographic distance
+        if 'dist_mean' in features:
+            feature_blocks.append(np.nan_to_num(
+                np.log1p(edges['DIST_KM_MEAN'].to_numpy().reshape(-1, 1))))
+            feature_names.append('log_dist_mean')
+        if 'dist_min' in features:
+            feature_blocks.append(np.nan_to_num(
+                np.log1p(edges['DIST_KM_MIN'].to_numpy().reshape(-1, 1))))
+            feature_names.append('log_dist_min')
+        if 'dist_median' in features:
+            feature_blocks.append(
+                np.nan_to_num(np.log1p(edges['DIST_KM_MEDIAN'].to_numpy().reshape(-1, 1))))
+            feature_names.append('log_dist_median')
+        if 'dist_centroid' in features:
+            feature_blocks.append(
+                np.nan_to_num(np.log1p(edges['DIST_KM_CENTROID'].to_numpy().reshape(-1, 1))))
+            feature_names.append('log_dist_centroid')
 
-    if 'latlon' in features:
-        # replace coords with z-scored versions to account for the boston
-        # metro being a small proportion of the whole earth
-        coord_cols = edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
-        lats = coord_cols.iloc[:, [0, 2]]
-        lons = coord_cols.iloc[:, [1, 3]]
-        lat_means, lat_stds, lon_means, lon_stds = z_score_stats
-        std_coords = coord_cols.assign(
-            **{col: lambda x, c=col: (x[c]-lat_means) / lat_stds for col in lats},
-            **{col: lambda x, c=col: (x[c]-lon_means) / lon_stds for col in lons},
-        )
-        feature_blocks.append(
-            std_coords.to_numpy())
-        feature_names.extend(['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B'])
+        if 'latlon' in features:
+            # replace coords with z-scored versions to account for the boston
+            # metro being a small proportion of the whole earth
+            coord_cols = edges[['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B']]
+            lats = coord_cols.iloc[:, [0, 2]]
+            lons = coord_cols.iloc[:, [1, 3]]
+            lat_means, lat_stds, lon_means, lon_stds = z_score_stats
+            std_coords = coord_cols.assign(
+                **{col: lambda x, c=col: (x[c]-lat_means) / lat_stds for col in lats},
+                **{col: lambda x, c=col: (x[c]-lon_means) / lon_stds for col in lons},
+            )
+            feature_blocks.append(
+                std_coords.to_numpy())
+            feature_names.extend(['LAT_A', 'LNG_A', 'LAT_B', 'LNG_B'])
 
-    if 'comm' in features:
-        # TODO: fill in if using comm
-        pass
+        if 'comm' in features:
+            # TODO: fill in if using comm
+            pass
 
-    if 'time' in features:
-        # TODO: probably something like add 4 cols to df for each node's distribution then add new col for js div
-        pass
+        if 'time' in features:
+            # TODO: probably something like add 4 cols to df for each node's distribution then add new col for js div
+            pass
 
-    if 'income' in features:
-        pass
+        if 'income' in features:
+            pass
 
-    if 'ls' in features:
-        pass
+        if 'ls' in features:
+            pass
+
+    else:
+        if 'dist' in features:
+            feature_blocks.append(np.nan_to_num(
+                np.log1p(edges['DIST_KM'].to_numpy().reshape(-1, 1))))
+            feature_names.append('log_dist_km')
+
+        if 'cat' in features:
+            cat_u = np.asarray(pd.factorize(edges['TAXONOMY_ORIGIN']))
+            cat_v = np.asarray(pd.factorize(edges['TAXONOMY_DESTINATION']))
+            feature_blocks.extend([cat_u, cat_v])
+            feature_names.extend(['category_A', 'category_B'])
+
+        if 'density' in features:
+            tract_u = np.asarray(edges['GEOID_ORIGIN'].str[:11])
+            tract_v = np.asarray(edges['GEOID_DESTINATION'].str[:11])
+            density_u = densities.reindex(tract_u).to_numpy().reshape(-1, 1)
+            density_v = densities.reindex(tract_v).to_numpy().reshape(-1, 1)
+            feature_blocks.extend([density_u, density_v])
+            feature_names.extend(['density_A', 'density_B'])
 
     X = np.hstack(feature_blocks).astype(np.float32)
 
@@ -1093,6 +1135,21 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
         z_score_stats = (lat_means, lat_stds, lon_means, lon_stds)
 
+    densities = None
+    if 'density' in features:
+        train_pairs = pd.concat([train_edges, train_non_edges])
+        if agg:
+            nodelist = edgelist_to_nodelist(train_pairs, ['NODE_A', 'NODE_B'])
+        else:
+            nodelist = edgelist_to_nodelist(
+                train_pairs, ['ORIGIN', 'DESTINATION'])
+        nodelist['TRACT'] = nodelist['GEOID'].str[:11]
+        tract_counts = nodelist['TRACT'].value_counts()
+        count_to_area = tract_to_area(tract_counts.to_frame())
+        count_to_area['DENSITY'] = count_to_area['count'] / \
+            count_to_area['ALAND']
+        densities = count_to_area[['TRACT', 'DENSITY']].set_index('TRACT')
+
     if not agg:
         # TODO: remove and rework if using POI-level again
         if ('cbg' in features or 'tract' in features):
@@ -1102,10 +1159,12 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
     _log_mem("before building train feature matrices")
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
-        train_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
+        train_edges, features, embedding_map, operator, cat_threshold, agg,
+        z_score_stats, densities)
     _log_mem("after X_train_pos built")
     X_train_neg, keep_train_neg, _ = build_feature_matrix(
-        train_non_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
+        train_non_edges, features, embedding_map, operator, cat_threshold, agg,
+        z_score_stats, densities)
     _log_mem("after X_train_neg built")
 
     X_train = np.vstack([X_train_pos, X_train_neg])
@@ -1208,9 +1267,11 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     # ===== Test =====
 
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
-        test_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
+        test_edges, features, embedding_map, operator, cat_threshold, agg,
+        z_score_stats, densities)
     X_test_neg, _, _ = build_feature_matrix(
-        test_non_edges, features, embedding_map, operator, cat_threshold, agg, z_score_stats)
+        test_non_edges, features, embedding_map, operator, cat_threshold, agg,
+        z_score_stats, densities)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     X_test = sm.add_constant(X_test, has_constant='add')
