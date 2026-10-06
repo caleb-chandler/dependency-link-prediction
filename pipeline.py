@@ -691,7 +691,7 @@ def tract_log_densities(pos_edges, agg):
             pos_edges[['NODE_B', 'N_POIS_B']].set_axis(
                 ['NODE', 'N_POIS'], axis=1),
         ], ignore_index=True).drop_duplicates(subset='NODE')
-        nodes['TRACT'] = nodes['NODE'].str.split('_', n=1).str[0]
+        nodes['TRACT'] = nodes['NODE'].astype(str).str.split('_', n=1).str[0]
         tract_counts = nodes.groupby('TRACT')['N_POIS'].sum().rename('count')
     else:
         nodes = edgelist_to_nodelist(pos_edges, ['ORIGIN', 'DESTINATION'])
@@ -931,9 +931,9 @@ def build_feature_matrix(
         if 'cat' in features:
             # count encoding with sum-to-zero rule
             cu = pd.Categorical(
-                edges['NODE_A'].str.split('_').str[1], categories=cats).codes
+                edges['NODE_A'].astype(str).str.split('_').str[1], categories=cats).codes
             cv = pd.Categorical(
-                edges['NODE_B'].str.split('_').str[1], categories=cats).codes
+                edges['NODE_B'].astype(str).str.split('_').str[1], categories=cats).codes
             # -1 = category not in cats
             assert (cu >= 0).all() and (cv >= 0).all()
 
@@ -952,8 +952,8 @@ def build_feature_matrix(
                 f'cat_{c.lower()}' for i, c in enumerate(cats) if i != ref)
 
         if 'density' in features:
-            tract_u = np.asarray(edges['NODE_A'].str.split('_').str[0])
-            tract_v = np.asarray(edges['NODE_B'].str.split('_').str[0])
+            tract_u = np.asarray(edges['NODE_A'].astype(str).str.split('_').str[0])
+            tract_v = np.asarray(edges['NODE_B'].astype(str).str.split('_').str[0])
             density_u = log_densities.reindex(
                 tract_u).to_numpy().reshape(-1, 1)
             density_v = log_densities.reindex(
@@ -1119,7 +1119,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             features = ['emb', 'dist', 'comm', 'time', 'income']
 
     # ensure none of the other 3 sets contain nodes not in train_pos
-    def node_set(df, agg):
+    def node_set(df):
         if agg:
             df = df[['NODE_A', 'NODE_B']].dropna()
             return set(pd.unique(df.values.ravel()))
@@ -1232,7 +1232,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         train_pairs = pd.concat([train_edges, train_non_edges])
         if agg:
             cats = sorted(
-                pd.unique(pd.concat([train_pairs['NODE_A'].str.split('_').str[1], train_pairs['NODE_B'].str.split('_')[1]])))
+                pd.unique(pd.concat([train_pairs['NODE_A'].astype(str).str.split('_').str[1], train_pairs['NODE_B'].astype(str).str.split('_').str[1]])))
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train_pairs['TAXONOMY_ORIGIN'], train_pairs['TAXONOMY_DESTINATION']])))
@@ -1644,7 +1644,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     if 'cat' in features:
         if agg:
             cats = sorted(
-                pd.unique(pd.concat([train['NODE_A'].str.split('_').str[1], train['NODE_B'].str.split('_')[1]])))
+                pd.unique(pd.concat([train['NODE_A'].astype(str).str.split('_').str[1], train['NODE_B'].astype(str).str.split('_').str[1]])))
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train['TAXONOMY_ORIGIN'], train['TAXONOMY_DESTINATION']])))
