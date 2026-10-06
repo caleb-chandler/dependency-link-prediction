@@ -681,6 +681,36 @@ def tract_to_area(nodes, shapefile_paths=(
     return nodes.join(all_tract_areas)
 
 
+def tract_log_densities(pos_edges, agg):
+    """log(POIs per km² of land) for every tract in the positive edges."""
+    if agg:
+        # agg nodes are tract+category buckets, so sum their POI counts per tract
+        nodes = pd.concat([
+            pos_edges[['NODE_A', 'N_POIS_A']].set_axis(
+                ['NODE', 'N_POIS'], axis=1),
+            pos_edges[['NODE_B', 'N_POIS_B']].set_axis(
+                ['NODE', 'N_POIS'], axis=1),
+        ], ignore_index=True).drop_duplicates(subset='NODE')
+        nodes['TRACT'] = nodes['NODE'].str.split('_', n=1).str[0]
+        tract_counts = nodes.groupby('TRACT')['N_POIS'].sum().rename('count')
+    else:
+        nodes = edgelist_to_nodelist(pos_edges, ['ORIGIN', 'DESTINATION'])
+        tract_counts = nodes['GEOID'].astype(
+            str).str[:11].value_counts().rename('count')
+
+    count_to_area = tract_to_area(tract_counts.to_frame())
+    # water-only tracts have ALAND 0; tracts missing from the shapefile come back NaN
+    area_km2 = count_to_area['ALAND'].replace(0, np.nan) / 1e6
+    log_densities = np.log(count_to_area['count'] / area_km2)
+
+    bad = ~np.isfinite(log_densities)
+    if bad.any():
+        print(f"Notice: {bad.sum()} tracts with no land area or no shapefile match "
+              f"({list(log_densities.index[bad][:5])}); filled with the median log density.")
+        log_densities[bad] = log_densities[~bad].median()
+    return log_densities
+
+
 def node_to_comm(G):
     # TODO: before you use this again have it add a step to convert df to nx.Graph
     im = Infomap("--num-trials 20")
@@ -768,7 +798,7 @@ def edgelist_to_nodelist(df, names):
     def de_edgify(df, indicator):
         col_names = df.columns.tolist()
         mapper = {n: n.replace(indicator, '') for n in col_names}
-        indicator2 = indicator.replace('_', '')
+        indicator2 = indicator.removeprefix('_')
         mapper |= {indicator2: 'NODE'}
         return df.rename(mapper, axis=1)
 
@@ -780,7 +810,7 @@ def edgelist_to_nodelist(df, names):
 
 def build_feature_matrix(
         edges, features, embedding_map, operator='hadamard', cat_threshold=1, agg=False,
-        z_score_stats=None, cats=None, densities=None
+        z_score_stats=None, cats=None, log_densities=None
 ):
     """
     TODO: update this
@@ -901,9 +931,9 @@ def build_feature_matrix(
         if 'cat' in features:
             # count encoding with sum-to-zero rule
             cu = pd.Categorical(
-                edges['NODE_A'].str.split('_')[1], categories=cats).codes
+                edges['NODE_A'].str.split('_').str[1], categories=cats).codes
             cv = pd.Categorical(
-                edges['NODE_B'].str.split('_')[1], categories=cats).codes
+                edges['NODE_B'].str.split('_').str[1], categories=cats).codes
             # -1 = category not in cats
             assert (cu >= 0).all() and (cv >= 0).all()
 
@@ -919,15 +949,19 @@ def build_feature_matrix(
                 counts[:, [ref]]   # (n, 19), values -2..2
             feature_blocks.append(cat_feat)
             feature_names.extend(
-                c for i, c in enumerate(cats) if i != ref)
+                f'cat_{c.lower()}' for i, c in enumerate(cats) if i != ref)
 
         if 'density' in features:
-            tract_u = np.asarray(edges['NODE_A'].str.split('_')[0])
-            tract_v = np.asarray(edges['NODE_B'].str.split('_')[0])
-            density_u = densities.reindex(tract_u).to_numpy().reshape(-1, 1)
-            density_v = densities.reindex(tract_v).to_numpy().reshape(-1, 1)
-            feature_blocks.extend([density_u, density_v])
-            feature_names.extend(['density_A', 'density_B'])
+            tract_u = np.asarray(edges['NODE_A'].str.split('_').str[0])
+            tract_v = np.asarray(edges['NODE_B'].str.split('_').str[0])
+            density_u = log_densities.reindex(
+                tract_u).to_numpy().reshape(-1, 1)
+            density_v = log_densities.reindex(
+                tract_v).to_numpy().reshape(-1, 1)
+            assert np.isfinite(density_u).all() and np.isfinite(density_v).all(), \
+                'density lookup hit a tract not in log_densities'
+            feature_blocks.extend([np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
+            feature_names.extend(['log_density_min', 'log_density_max'])
 
     else:
         if 'dist' in features:
@@ -936,35 +970,39 @@ def build_feature_matrix(
             feature_names.append('log_dist_km')
 
         if 'cat' in features:
-            # count encoding with sum-to-zero rule
+            # same as above
             cu = pd.Categorical(
                 edges['TAXONOMY_ORIGIN'], categories=cats).codes
             cv = pd.Categorical(
                 edges['TAXONOMY_DESTINATION'], categories=cats).codes
-            # -1 = category not in cats
             assert (cu >= 0).all() and (cv >= 0).all()
 
             n = len(edges)
             rows = np.arange(n)
             counts = np.zeros((n, len(cats)), dtype=np.int8)
             counts[rows, cu] += 1
-            # same-category pairs end up with a 2
             counts[rows, cv] += 1
 
-            ref = 0  # index of the column to drop
+            ref = 0
             cat_feat = np.delete(counts, ref, axis=1) - \
-                counts[:, [ref]]   # (n, 19), values -2..2
+                counts[:, [ref]]
             feature_blocks.append(cat_feat)
             feature_names.extend(
-                c for i, c in enumerate(cats) if i != ref)
+                f'cat_{c.lower()}' for i, c in enumerate(cats) if i != ref)
 
         if 'density' in features:
-            tract_u = np.asarray(edges['GEOID_ORIGIN'].str[:11])
-            tract_v = np.asarray(edges['GEOID_DESTINATION'].str[:11])
-            density_u = densities.reindex(tract_u).to_numpy().reshape(-1, 1)
-            density_v = densities.reindex(tract_v).to_numpy().reshape(-1, 1)
-            feature_blocks.extend([density_u, density_v])
-            feature_names.extend(['density_A', 'density_B'])
+            # same as above
+            tract_u = np.asarray(edges['GEOID_ORIGIN'].astype(str).str[:11])
+            tract_v = np.asarray(
+                edges['GEOID_DESTINATION'].astype(str).str[:11])
+            density_u = log_densities.reindex(
+                tract_u).to_numpy().reshape(-1, 1)
+            density_v = log_densities.reindex(
+                tract_v).to_numpy().reshape(-1, 1)
+            assert np.isfinite(density_u).all() and np.isfinite(density_v).all(), \
+                'density lookup hit a tract not in log_densities'
+            feature_blocks.extend([np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
+            feature_names.extend(['log_density_min', 'log_density_max'])
 
     X = np.hstack(feature_blocks).astype(np.float32)
 
@@ -1081,9 +1119,13 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             features = ['emb', 'dist', 'comm', 'time', 'income']
 
     # ensure none of the other 3 sets contain nodes not in train_pos
-    def node_set(df):
-        df = df[['NODE_A', 'NODE_B']].dropna()
-        return set(pd.unique(df.values.ravel()))
+    def node_set(df, agg):
+        if agg:
+            df = df[['NODE_A', 'NODE_B']].dropna()
+            return set(pd.unique(df.values.ravel()))
+        else:
+            df = df[['ORIGIN', 'DESTINATION']].dropna()
+            return set(pd.unique(df.values.ravel()))
 
     train_pos_nodes = node_set(train_edges)
     missing = {
@@ -1190,41 +1232,30 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         train_pairs = pd.concat([train_edges, train_non_edges])
         if agg:
             cats = sorted(
-                pd.unique(pd.concat([train_pairs['NODE_A'].str.split('_')[1], train_pairs['NODE_B'].str.split('_')[1]])))
+                pd.unique(pd.concat([train_pairs['NODE_A'].str.split('_').str[1], train_pairs['NODE_B'].str.split('_')[1]])))
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train_pairs['TAXONOMY_ORIGIN'], train_pairs['TAXONOMY_DESTINATION']])))
 
-    densities = None
+    log_densities = None
     if 'density' in features:
-        train_pairs = pd.concat([train_edges, train_non_edges])
-        if agg:
-            nodelist = edgelist_to_nodelist(train_pairs, ['NODE_A', 'NODE_B'])
-        else:
-            nodelist = edgelist_to_nodelist(
-                train_pairs, ['ORIGIN', 'DESTINATION'])
-        nodelist['TRACT'] = nodelist['GEOID'].str[:11]
-        tract_counts = nodelist['TRACT'].value_counts()
-        count_to_area = tract_to_area(tract_counts.to_frame())
-        count_to_area['DENSITY'] = count_to_area['count'] / \
-            count_to_area['ALAND']
-        densities = count_to_area[['TRACT', 'DENSITY']].set_index('TRACT')
+        log_densities = tract_log_densities(train_edges, agg)
 
-    if not agg:
-        # TODO: remove and rework if using POI-level again
-        if ('cbg' in features or 'tract' in features):
-            node_to_area(G)
-        if 'time' in features or 'income' in features:
-            add_outside_metadata(G)
+    # if not agg:
+        # # TODO: remove and rework if using POI-level again
+        # if ('cbg' in features or 'tract' in features):
+        #     node_to_area(G)
+        # if 'time' in features or 'income' in features:
+        #     add_outside_metadata(G)
 
     _log_mem("before building train feature matrices")
     X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
         train_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, densities)
+        z_score_stats, cats, log_densities)
     _log_mem("after X_train_pos built")
     X_train_neg, keep_train_neg, _ = build_feature_matrix(
         train_non_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, densities)
+        z_score_stats, cats, log_densities)
     _log_mem("after X_train_neg built")
 
     X_train = np.vstack([X_train_pos, X_train_neg])
@@ -1328,10 +1359,10 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
     X_test_pos, keep_test_pos, _ = build_feature_matrix(
         test_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, densities)
+        z_score_stats, cats, log_densities)
     X_test_neg, _, _ = build_feature_matrix(
         test_non_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, densities)
+        z_score_stats, cats, log_densities)
 
     X_test = np.vstack([X_test_pos, X_test_neg])
     X_test = sm.add_constant(X_test, has_constant='add')
@@ -1485,7 +1516,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             'pred_df': pred_df}
 
 
-def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='SparseOTF',
+def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='SparseOTF', agg=True,
                         operator=None, embedding_map=None, standardize=False, compressed=True, **kwargs):
     '''
     1. embeddings
@@ -1599,25 +1630,40 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
         lats = train_coord_cols[['LAT_A', 'LAT_B']]
         lats = lats.stack().reset_index(drop=True)
-        lons = train_coord_cols[['LNG_A', 'LNG_B']]
-        lons = lons.stack().reset_index(drop=True)
+        lngs = train_coord_cols[['LNG_A', 'LNG_B']]
+        lngs = lngs.stack().reset_index(drop=True)
 
         lat_means = lats.mean()
         lat_stds = lats.std()
-        lon_means = lons.mean()
-        lon_stds = lons.std()
+        lng_means = lngs.mean()
+        lng_stds = lngs.std()
 
-        z_score_stats = (lat_means, lat_stds, lon_means, lon_stds)
+        z_score_stats = (lat_means, lat_stds, lng_means, lng_stds)
+
+    cats = None
+    if 'cat' in features:
+        if agg:
+            cats = sorted(
+                pd.unique(pd.concat([train['NODE_A'].str.split('_').str[1], train['NODE_B'].str.split('_')[1]])))
+        else:
+            cats = sorted(pd.unique(pd.concat(
+                [train['TAXONOMY_ORIGIN'], train['TAXONOMY_DESTINATION']])))
+
+    log_densities = None
+    if 'density' in features:
+        log_densities = tract_log_densities(train, agg)
 
     X_train, _, feature_names = build_feature_matrix(
-        train, features, embedding_map, operator, z_score_stats=z_score_stats)
+        train, features, embedding_map, operator,
+        agg=agg, z_score_stats=z_score_stats, cats=cats, log_densities=log_densities)
     if compressed:
         y_train = train['LOG_'+capweight]
     else:
         y_train = train[capweight]
 
     X_test, _, _ = build_feature_matrix(
-        test, features, embedding_map, operator, z_score_stats=z_score_stats)
+        test, features, embedding_map, operator,
+        agg=agg, z_score_stats=z_score_stats, cats=cats, log_densities=log_densities)
     if compressed:
         y_test = test['LOG_'+capweight]
     else:
