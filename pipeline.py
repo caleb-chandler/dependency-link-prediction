@@ -493,30 +493,53 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
 # ====================================================================
 
 
+def fast_read_csv(fpath, custom_dtypes=None, usecols=None):
+    if custom_dtypes is None:
+        custom_dtypes = {}
+
+    sample_df = pd.read_csv(fpath, nrows=1)
+
+    dtype_dict = {}
+    for col, current_dtype in sample_df.dtypes.items():
+        if col in custom_dtypes:
+            dtype_dict[col] = custom_dtypes[col]
+        elif current_dtype == 'float64':
+            dtype_dict[col] = 'float32'
+
+    return pd.read_csv(fpath, dtype=dtype_dict, usecols=usecols) if usecols else pd.read_csv(fpath, dtype=dtype_dict)
+
+
 def prepare_data(
     _path, logistic=False, test_frac=0.5, seed=None, compress=True, weight=None, metadata=False, write=True,
-    trainfile='data/train.txt'
+    trainfile='data/train.txt', n_bins=50
 ):
     """
-    1) splits data into train and test sets
-    2) writes training graph for node2vec
+    1) splits the edges into train and test sets, holding the maximum spanning tree out of the test
+       pool so every node keeps at least one training edge
+    2) logistic only: samples distance-controlled non-edges for both sets
+    3) writes the training graph (train edges) for node2vec
 
     Parameters:
-    _path (str): Path to the graph file. Must be readable as edgelist.
+    _path (str): Path to the edge csv, agg (NODE_A/NODE_B) or poi-level (ORIGIN/DESTINATION).
+    logistic (bool, optional): Link prediction split with non-edges. Poi-level only, since agg link
+        splits come from the external drop. Default is False (weight prediction, edges only).
     test_frac (float, optional): Fraction of edges to use for testing. Default is 0.5.
     seed (int, optional): Seed for reproducibility.
     compress (int, optional): Option to log-transform weights when creating training graph
+    n_bins (int, optional): Number of log distance bins the non-edges are matched over. Default is 50.
 
-    If neg_path, returns:
-        file : file consisting of the positive training graph as an edgelist. saved to 'trainfile'
-        pd.DataFrame : negative training samples
-        pd.DataFrame : positive testing samples
-        pd.DataFrame : negative testing samples
-    Otherwise returns the same but no negatives.
+    Non-edges come from dist_controlled_sampler: random poi pairs fill each bin of the set's own edge
+    DIST_KM distribution (same binning as distribution_finder), so each set matches its edges bin
+    for bin, 1:1. Neither set overlaps an edge or the other set. They carry the edges' node columns (taxonomy, geoid, lat/lng,
+    ...) plus DIST_KM, oriented ORIGIN < DESTINATION like the edges.
+
+    Returns:
+        logistic=False: {'train': pd.DataFrame, 'test': pd.DataFrame}
+        logistic=True: (train_pos, train_neg, test_pos, test_neg) as pd.DataFrames
+    The training graph is written to 'trainfile' in both cases.
     """
     # TODO: add functionality as needed
     # - extra graph attrs
-    # - logistic path if using again
 
     if seed is not None:
         random.seed(seed)
@@ -527,24 +550,22 @@ def prepare_data(
 
     # --- read in data ---
 
-    def fast_read_csv(fpath, _dtypes):
-        headers = pd.read_csv(fpath, nrows=0).columns
-        _dtypes = {col: dt for col, dt in _dtypes.items() if col in headers}
-        return pd.read_csv(fpath, dtype=_dtypes)
-
     # downcast for better performance
-    _dtypes = {
-        'NODE_A': 'category', 'NODE_B': 'category',
-        'N_COVISITS': 'float32', 'DIST_KM_MIN': 'float32',
-        'DIST_KM_MEAN': 'float32', 'DIST_KM_MEDIAN': 'float32',
-        'DIST_KM_CENTROID': 'float32', 'N_UIDS_A': 'float32',
-        'N_POIS_A': 'float32', 'N_VISITS_A': 'float32',
-        'N_UIDS_B': 'float32', 'N_POIS_B': 'float32',
-        'N_VISITS_B': 'float32', 'DEP': 'float32'
-    }
-    edgelist = fast_read_csv(_path, _dtypes)
+    _dtypes = {'NODE_A': 'category',
+               'NODE_B': 'category',
+               'ORIGIN': 'category',
+               'DESTINATION': 'category',
+               'TAXONOMY_ORIGIN': 'category',
+               'TAXONOMY_DESTINATION': 'category'}
+    edgelist = fast_read_csv(_path, custom_dtypes=_dtypes)
     if compress:
         edgelist['LOG_'+capweight] = np.log1p(edgelist[capweight])
+    # universal endpoints
+    node_a, node_b = ('NODE_A', 'NODE_B') if 'NODE_A' in edgelist.columns else (
+        'ORIGIN', 'DESTINATION')
+    if logistic and node_a != 'ORIGIN':
+        raise SystemExit(
+            'Error: logistic splits are poi-level only (agg link splits come from the external drop).')
 
     print('Converting to nx.Graph for MST...')
     # add index as col
@@ -555,79 +576,135 @@ def prepare_data(
     edgelist = edgelist.reset_index()
     if weight:
         G = nx.from_pandas_edgelist(
-            edgelist, 'NODE_A', 'NODE_B', edge_attr=['index', capweight])
+            edgelist, node_a, node_b, edge_attr=['index', capweight])
     else:
         G = nx.from_pandas_edgelist(
-            edgelist, 'NODE_A', 'NODE_B', edge_attr='index')
+            edgelist, node_a, node_b, edge_attr='index')
+
+    # the run functions need a connected training graph, so keep only the largest component
+    if not nx.is_connected(G):
+        lcc = max(nx.connected_components(G), key=len)
+        keep = edgelist[node_a].isin(lcc) & edgelist[node_b].isin(lcc)
+        print(f'Notice: graph is disconnected; keeping its largest component '
+              f'({len(lcc)}/{G.number_of_nodes()} nodes, {keep.sum()}/{len(edgelist)} edges).')
+        edgelist = edgelist[keep]
+        G = G.subgraph(lcc).copy()
+
+    if logistic:
+        # one row of attributes per poi (identical on every edge it appears in)
+        nodes = edgelist_to_nodelist(
+            edgelist, [node_a, node_b]).set_index('NODE')
+        # n_bins log distance bins over all edges (same binning as distribution_finder)
+        log_bins = np.concatenate(
+            ([0], np.geomspace(0.01, edgelist['DIST_KM'].max(), n_bins)))
+        edge_cols = list(edgelist.columns)
 
     # use nx.Graph to find mst edges, then go back to df and sample while excluding them
-    edges = {tuple(sorted(e)) for e in G.edges()}
     mst_idx = [d['index'] for _, _, d in
                nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
-    num_removable = len(edges) - len(mst_idx)
+    num_removable = G.number_of_edges() - len(mst_idx)
     test_num = (test_frac) * len(edgelist)
     if num_removable < test_num:
         raise SystemExit(
-            f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {len(num_removable)} available.)')
+            f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {num_removable} available.)')
 
-    if not logistic:
-        # apply back to df
-        edgelist_safe = edgelist.drop(index=mst_idx)
-        # sample the same amount from edgelist_safe as would be needed to sample frac from original
-        test = edgelist_safe.sample(
-            n=int(round(test_num)), random_state=seed)
-        train = edgelist.drop(test.index)
+    # apply back to df
+    edgelist_safe = edgelist.drop(index=mst_idx)
+    # sample the same amount from edgelist_safe as would be needed to sample frac from original
+    test = edgelist_safe.sample(
+        n=int(round(test_num)), random_state=seed)
+    train = edgelist.drop(test.index)
+    # free the full-size copies before the sampler and training graph need the memory
+    del edgelist_safe, edgelist
 
-        # --- build + write training graph ---
+    # --- distance-controlled non-edges ---
 
-        if write:
-            # TODO: dont forget to include attr dict here as well
-            if weight:
-                G_train = nx.from_pandas_edgelist(
-                    train, 'NODE_A', 'NODE_B', edge_attr='LOG_'+capweight if compress else capweight)
-                for u, v, data in G_train.edges(data=True):
-                    if compress:
-                        wgt_val = data.pop('LOG_'+capweight)
-                        data['weight'] = wgt_val
-                    else:
-                        wgt_val = data.pop(capweight)
-                        data['weight'] = wgt_val
-            else:
-                G_train = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
+    if logistic:
+        # the sampler reads poi coordinates off the graph, and never returns an edge of G
+        nx.set_node_attributes(G, nodes['LAT'].to_dict(), 'latitude')
+        nx.set_node_attributes(G, nodes['LNG'].to_dict(), 'longitude')
+        # each set's non-edges match that set's own edge distances bin for bin. the mst edges kept
+        # in train run short, so one shared distribution would offset the two sets in opposite ways
+        # (precision keeps the bin labels exact: the sampler reads its bin edges back off them, and
+        # the default 3 digits would shift each edge by up to ~0.4%)
+        def distr(edges):
+            return pd.cut(edges['DIST_KM'], bins=log_bins, include_lowest=True,
+                          precision=10).value_counts().sort_index()
+        print('Sampling distance-controlled non-edges...')
+        test_pairs = dist_controlled_sampler(G, distr(test), len(test))
+        train_pairs = dist_controlled_sampler(
+            G, distr(train), len(train), avoid=test_pairs)
 
-            if nx.is_empty(G_train):
-                raise SystemExit("Error: Empty training graph.")
+        def to_frame(pairs):
+            u, v = (np.array(x, dtype=object) for x in zip(*pairs))
+            # same orientation as the edges (ORIGIN < DESTINATION), so endpoint order carries no label
+            a, b = np.where(u < v, u, v), np.where(u < v, v, u)
+            frame = pd.DataFrame({node_a: pd.Categorical(a, categories=nodes.index),
+                                  node_b: pd.Categorical(b, categories=nodes.index)})
+            for side, ids in ((node_a, a), (node_b, b)):
+                attrs = nodes.reindex(ids)
+                for col in nodes.columns:
+                    frame[f'{col}_{side}'] = attrs[col].values
+            # same formula as the edges' DIST_KM (matches it to ~1e-6)
+            frame['DIST_KM'] = haversine(
+                frame[f'LAT_{node_a}'].to_numpy(np.float64), frame[f'LNG_{node_a}'].to_numpy(np.float64),
+                frame[f'LAT_{node_b}'].to_numpy(np.float64), frame[f'LNG_{node_b}'].to_numpy(np.float64)).astype(np.float32)
+            # columns in the edges' order
+            return frame[[c for c in edge_cols if c in frame.columns]]
 
-            # saving training graph
-            trainfile = Path(trainfile)
-            if not trainfile.is_file():
+        test_neg = to_frame(test_pairs)
+        train_neg = to_frame(train_pairs)
+        print(f'Non-edges: {len(train_neg)} train / {len(test_neg)} test '
+              f'(edges: {len(train)} / {len(test)})')
+        del test_pairs, train_pairs, nodes
+    del G
+
+    # --- build + write training graph ---
+
+    if write:
+        # TODO: dont forget to include attr dict here as well
+        if weight:
+            G_train = nx.from_pandas_edgelist(
+                train, node_a, node_b, edge_attr='LOG_'+capweight if compress else capweight)
+            for u, v, data in G_train.edges(data=True):
+                if compress:
+                    wgt_val = data.pop('LOG_'+capweight)
+                    data['weight'] = wgt_val
+                else:
+                    wgt_val = data.pop(capweight)
+                    data['weight'] = wgt_val
+        else:
+            G_train = nx.from_pandas_edgelist(train, node_a, node_b)
+
+        if nx.is_empty(G_train):
+            raise SystemExit("Error: Empty training graph.")
+
+        # saving training graph
+        trainfile = Path(trainfile)
+        if not trainfile.is_file():
+            with open(trainfile, 'w') as f:
+                for u, v, d in G_train.edges(data=True):
+                    f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
+            print(
+                f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
+        else:
+            _overwrite = input("Trainfile already exists. Overwrite? Y/N")
+            if (_overwrite == 'y' or _overwrite == 'Y'):
                 with open(trainfile, 'w') as f:
                     for u, v, d in G_train.edges(data=True):
                         f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
                 print(
                     f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
             else:
-                _overwrite = input("Trainfile already exists. Overwrite? Y/N")
-                if (_overwrite == 'y' or _overwrite == 'Y'):
-                    with open(trainfile, 'w') as f:
-                        for u, v, d in G_train.edges(data=True):
-                            f.write(f"{u}\t{v}\t{d.get('weight', 1.0)}\n")
-                    print(
-                        f"Wrote training graph: {G_train.number_of_nodes()} nodes, {G_train.number_of_edges()} edges")
-                else:
-                    print('Overwrite skipped; using existing training graph.')
-    else:
-        print("Error: Logistic branch incomplete")
-        return None
+                print('Overwrite skipped; using existing training graph.')
 
     if metadata:
         print("Error: Metadata branch incomplete")
         return None
 
+    if logistic:
+        return train, train_neg, test, test_neg
     return {'train': train, 'test': test}
-
-    # TODO: add functionality for logistic if needed
-    # return G_train, train_neg, test_pos, test_neg
 
 # ====================================================================
 
@@ -952,15 +1029,18 @@ def build_feature_matrix(
                 f'cat_{c.lower()}' for i, c in enumerate(cats) if i != ref)
 
         if 'density' in features:
-            tract_u = np.asarray(edges['NODE_A'].astype(str).str.split('_').str[0])
-            tract_v = np.asarray(edges['NODE_B'].astype(str).str.split('_').str[0])
+            tract_u = np.asarray(
+                edges['NODE_A'].astype(str).str.split('_').str[0])
+            tract_v = np.asarray(
+                edges['NODE_B'].astype(str).str.split('_').str[0])
             density_u = log_densities.reindex(
                 tract_u).to_numpy().reshape(-1, 1)
             density_v = log_densities.reindex(
                 tract_v).to_numpy().reshape(-1, 1)
             assert np.isfinite(density_u).all() and np.isfinite(density_v).all(), \
                 'density lookup hit a tract not in log_densities'
-            feature_blocks.extend([np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
+            feature_blocks.extend(
+                [np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
             feature_names.extend(['log_density_min', 'log_density_max'])
 
     else:
@@ -1001,7 +1081,8 @@ def build_feature_matrix(
                 tract_v).to_numpy().reshape(-1, 1)
             assert np.isfinite(density_u).all() and np.isfinite(density_v).all(), \
                 'density lookup hit a tract not in log_densities'
-            feature_blocks.extend([np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
+            feature_blocks.extend(
+                [np.minimum(density_u, density_v), np.maximum(density_u, density_v)])
             feature_names.extend(['log_density_min', 'log_density_max'])
 
     X = np.hstack(feature_blocks).astype(np.float32)
@@ -1109,6 +1190,10 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         np.random.seed(seed)
         os.environ['PYTHONHASHSEED'] = str(seed)
 
+    # universal endpoints
+    node_a, node_b = ('NODE_A', 'NODE_B') if 'NODE_A' in train_edges.columns else (
+        'ORIGIN', 'DESTINATION')
+
     # TODO: update
     if not agg:
         if features == 'all' or features == ['all']:
@@ -1120,12 +1205,8 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
 
     # ensure none of the other 3 sets contain nodes not in train_pos
     def node_set(df):
-        if agg:
-            df = df[['NODE_A', 'NODE_B']].dropna()
-            return set(pd.unique(df.values.ravel()))
-        else:
-            df = df[['ORIGIN', 'DESTINATION']].dropna()
-            return set(pd.unique(df.values.ravel()))
+        df = df[[node_a, node_b]].dropna()
+        return set(pd.unique(df.values.ravel()))
 
     train_pos_nodes = node_set(train_edges)
     missing = {
@@ -1141,7 +1222,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         raise SystemExit
 
     # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(train_edges, 'NODE_A', 'NODE_B')
+    G = nx.from_pandas_edgelist(train_edges, node_a, node_b)
     assert nx.is_connected(G), 'Error: disconnected training graph.'
 
     # ===== Embedding generation (only if needed) =====
@@ -1232,7 +1313,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         train_pairs = pd.concat([train_edges, train_non_edges])
         if agg:
             cats = sorted(
-                pd.unique(pd.concat([train_pairs['NODE_A'].astype(str).str.split('_').str[1], train_pairs['NODE_B'].astype(str).str.split('_').str[1]])))
+                pd.unique(pd.concat([train_pairs[node_a].astype(str).str.split('_').str[1], train_pairs[node_b].astype(str).str.split('_').str[1]])))
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train_pairs['TAXONOMY_ORIGIN'], train_pairs['TAXONOMY_DESTINATION']])))
@@ -1322,8 +1403,8 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     if dyadic_se:
         # node codes in X_train row order (train positives, then negatives)
         (a_pos, a_neg, b_pos, b_neg), n_nodes = _node_codes([
-            train_edges['NODE_A'], train_non_edges['NODE_A'],
-            train_edges['NODE_B'], train_non_edges['NODE_B']])
+            train_edges[node_a], train_non_edges[node_a],
+            train_edges[node_b], train_non_edges[node_b]])
         ia = np.concatenate([a_pos[keep_train_pos], a_neg[keep_train_neg]])
         ib = np.concatenate([b_pos[keep_train_pos], b_neg[keep_train_neg]])
         tgt = getattr(link_model, '_results', link_model)
@@ -1391,7 +1472,7 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     pred_df['PROB'] = link_probs
     pred_df['PRED'] = link_preds
     # convert back to categories for lower memory usage
-    for col in ('NODE_A', 'NODE_B'):
+    for col in (node_a, node_b):
         pred_df[col] = union_categoricals(
             [test_edges[col], test_non_edges[col]])
 
@@ -1548,6 +1629,10 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     else:
         print("Notice: seed not passed.")
 
+    # universal endpoints
+    node_a, node_b = ('NODE_A', 'NODE_B') if 'NODE_A' in train.columns else (
+        'ORIGIN', 'DESTINATION')
+
     capweight = 'DEP' if weight == 'dep' else (
         'N_COVISITS' if weight == 'cov' else None)
 
@@ -1559,7 +1644,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
         assert operator, "Error: binary operator must be selected if using embeddings."
 
     # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(train, 'NODE_A', 'NODE_B')
+    G = nx.from_pandas_edgelist(train, node_a, node_b)
     assert nx.is_connected(G), 'Error: disconnected training graph.'
 
     # ===== Embedding generation (only if needed) =====
@@ -1644,7 +1729,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     if 'cat' in features:
         if agg:
             cats = sorted(
-                pd.unique(pd.concat([train['NODE_A'].astype(str).str.split('_').str[1], train['NODE_B'].astype(str).str.split('_').str[1]])))
+                pd.unique(pd.concat([train[node_a].astype(str).str.split('_').str[1], train[node_b].astype(str).str.split('_').str[1]])))
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train['TAXONOMY_ORIGIN'], train['TAXONOMY_DESTINATION']])))
@@ -1713,7 +1798,7 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
     # account for dependence between edges sharing nodes
     # node codes in X_train row order (build_feature_matrix keeps every row)
-    (ia, ib), n_nodes = _node_codes([train['NODE_A'], train['NODE_B']])
+    (ia, ib), n_nodes = _node_codes([train[node_a], train[node_b]])
     tgt = getattr(model, '_results', model)
     # read the nonrobust SEs off normalized_cov_params rather than .bse:
     # .bse is cache_readonly, and touching it first would freeze the
