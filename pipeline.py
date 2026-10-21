@@ -585,8 +585,8 @@ def prepare_data(
     trainfile='data/train.txt', n_bins=50
 ):
     """
-    1) splits the edges into train and test sets, holding the maximum spanning tree out of the test
-       pool so every node keeps at least one training edge
+    1) splits the edges randomly into train and test sets, with test edges whose pois are left without 
+    a training edge dropped and reported
     2) logistic only: samples distance-controlled non-edges for both sets
     3) writes the training graph (train edges) for node2vec
 
@@ -638,7 +638,6 @@ def prepare_data(
         raise SystemExit(
             'Error: logistic splits are poi-level only (agg link splits come from the external drop).')
 
-    print('Converting to nx.Graph for MST...')
     # add index as col
     # TODO: add to attr dict as needed
     # attrs = {
@@ -652,7 +651,7 @@ def prepare_data(
         G = nx.from_pandas_edgelist(
             edgelist, node_a, node_b, edge_attr='index')
 
-    # the run functions need a connected training graph, so keep only the largest component
+    # keep the largest component
     if not nx.is_connected(G):
         lcc = max(nx.connected_components(G), key=len)
         keep = edgelist[node_a].isin(lcc) & edgelist[node_b].isin(lcc)
@@ -670,23 +669,21 @@ def prepare_data(
             ([0], np.geomspace(0.01, edgelist['DIST_KM'].max(), n_bins)))
         edge_cols = list(edgelist.columns)
 
-    # use nx.Graph to find mst edges, then go back to df and sample while excluding them
-    mst_idx = [d['index'] for _, _, d in
-               nx.maximum_spanning_tree(G, weight=capweight if weight else None).edges(data=True)]
-    num_removable = G.number_of_edges() - len(mst_idx)
     test_num = (test_frac) * len(edgelist)
-    if num_removable < test_num:
-        raise SystemExit(
-            f'Not enough removable edges. Test fraction is too high.\n({test_num} req / {num_removable} available.)')
 
-    # apply back to df
-    edgelist_safe = edgelist.drop(index=mst_idx)
-    # sample the same amount from edgelist_safe as would be needed to sample frac from original
-    test = edgelist_safe.sample(
+    test = edgelist.sample(
         n=int(round(test_num)), random_state=seed)
     train = edgelist.drop(test.index)
-    # free the full-size copies before the sampler and training graph need the memory
-    del edgelist_safe, edgelist
+    # free the full-size copy before the sampler and training graph need the memory
+    del edgelist
+
+    # drop test edges at pois left without a training edge (they'd get no embedding)
+    covered = set(pd.unique(train[[node_a, node_b]].values.ravel()))
+    keep_test = test[node_a].isin(covered) & test[node_b].isin(covered)
+    n_lost = len(
+        set(pd.unique(test[[node_a, node_b]].values.ravel())) - covered)
+    print(f'Notice: {n_lost} pois have no training edge; dropping the {(~keep_test).sum()} test edges that touch them.')
+    test = test[keep_test]
 
     # --- distance-controlled non-edges ---
 
@@ -694,18 +691,16 @@ def prepare_data(
         # the sampler reads poi coordinates off the graph, and never returns an edge of G
         nx.set_node_attributes(G, nodes['LAT'].to_dict(), 'latitude')
         nx.set_node_attributes(G, nodes['LNG'].to_dict(), 'longitude')
-        # each set's non-edges match that set's own edge distances bin for bin. the mst edges kept
-        # in train run short, so one shared distribution would offset the two sets in opposite ways
-        # (precision keeps the bin labels exact: the sampler reads its bin edges back off them, and
-        # the default 3 digits would shift each edge by up to ~0.4%)
+        # each set's non-edges match that set's own edge distances bin for bin
 
         def distr(edges):
             return pd.cut(edges['DIST_KM'], bins=log_bins, include_lowest=True,
                           precision=10).value_counts().sort_index()
         print('Sampling distance-controlled non-edges...')
-        test_pairs = dist_controlled_sampler(G, distr(test), len(test))
+        G_cov = G.subgraph(covered)
+        test_pairs = dist_controlled_sampler(G_cov, distr(test), len(test))
         train_pairs = dist_controlled_sampler(
-            G, distr(train), len(train), avoid=test_pairs)
+            G_cov, distr(train), len(train), avoid=test_pairs)
 
         def to_frame(pairs):
             u, v = (np.array(x, dtype=object) for x in zip(*pairs))
@@ -1316,12 +1311,6 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
                   + (f' (e.g. {sorted(v)[:3]})' if v else ''))
         raise SystemExit
 
-    # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(train_edges, node_a, node_b)
-    assert nx.is_connected(G), 'Error: disconnected training graph.'
-    # only needed for the check (~5 GB at poi scale if it stays around for the fit)
-    del G
-
     # ===== Embedding generation (only if needed) =====
 
     if any(f in features for f in ('emb', 'cosine')) and embedding_map is not None:
@@ -1723,12 +1712,6 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
     if any(f in features for f in ('emb', 'cosine')):
         assert operator, "Error: binary operator must be selected if using embeddings."
-
-    # ensure training graph is fully connected
-    G = nx.from_pandas_edgelist(train, node_a, node_b)
-    assert nx.is_connected(G), 'Error: disconnected training graph.'
-    # only needed for the check (~5 GB at poi scale if it stays around for the fit)
-    del G
 
     # ===== Embedding generation (only if needed) =====
 
