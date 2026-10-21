@@ -11,6 +11,7 @@ from infomap import Infomap
 from scipy.spatial.distance import jensenshannon
 from scipy.sparse import csr_matrix
 import statsmodels.api as sm
+from statsmodels.regression.linear_model import OLSResults, RegressionResultsWrapper
 import pickle
 import psutil
 import os
@@ -115,7 +116,8 @@ def _chunked_logit_hessian(self, params, chunk_size=500_000):
     L = self.predict(params)
     n, p = X.shape
     _log_mem(f"entered _chunked_logit_hessian (n={n}, p={p})")
-    hess = np.zeros((p, p), dtype=X.dtype)
+    # float64 even when exog is stored as float32: a float32 sum over millions of rows loses precision
+    hess = np.zeros((p, p))
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         w = L[start:end] * (1 - L[start:end])
@@ -159,7 +161,8 @@ def _chunked_binary_predict(self, params, exog=None, which="mean", linear=None,
         exog = self.exog
 
     n = exog.shape[0]
-    linpred = np.empty(n, dtype=exog.dtype)
+    # float64 even when exog is stored as float32
+    linpred = np.empty(n)
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         linpred[start:end] = np.dot(exog[start:end], params) + offset
@@ -180,6 +183,74 @@ sm.Logit.predict = _chunked_binary_predict
 
 
 sm.Logit.hessian = _chunked_logit_hessian
+
+
+# the run functions store the design matrix as float32 to halve its memory. these replace the
+# statsmodels methods that would otherwise convert the whole matrix to float64 in one go
+
+
+def _chunked_logit_score(self, params, chunk_size=500_000):
+    """Drop-in replacement for Logit.score: the same sum of (y - p) x, over row chunks.
+    The original's np.dot(y - fitted, X) converts a float32 exog to float64 all at once."""
+    X, y = self.exog, self.endog
+    fitted = self.predict(params)
+    score = np.zeros(X.shape[1])
+    for start in range(0, X.shape[0], chunk_size):
+        end = start + chunk_size
+        score += (y[start:end] - fitted[start:end]) @ X[start:end]
+    return score
+
+
+def _chunked_linear_predict(self, params, exog=None, chunk_size=1_000_000):
+    """Drop-in replacement for OLS.predict: the same np.dot(exog, params), over row chunks."""
+    if exog is None:
+        exog = self.exog
+    out = np.empty(exog.shape[0])
+    for start in range(0, exog.shape[0], chunk_size):
+        out[start:start + chunk_size] = exog[start:start + chunk_size] @ params
+    return out
+
+
+def _chunked_ols_loglike(self, params, scale=None):
+    """Drop-in replacement for OLS.loglike (used by llf, aic, bic and summary2): the same formula,
+    with the fitted values from the chunked predict instead of np.dot(self.exog, params)."""
+    nobs2 = self.nobs / 2.0
+    resid = self.endog - self.predict(params)
+    if hasattr(self, 'offset'):
+        resid -= self.offset
+    ssr = np.sum(resid**2)
+    if scale is None:
+        return -nobs2*np.log(2*np.pi) - nobs2*np.log(ssr / float(self.nobs)) - nobs2
+    return -nobs2 * np.log(2 * np.pi * scale) - ssr / (2*scale)
+
+
+sm.Logit.score = _chunked_logit_score
+sm.OLS.predict = _chunked_linear_predict
+sm.OLS.loglike = _chunked_ols_loglike
+
+
+def _fit_ols(mod, chunk_size=500_000):
+    """OLS fit from the normal equations, with X'X and X'y summed over row chunks in float64.
+
+    Stands in for mod.fit(method='pinv'), whose SVD holds several float64 copies of the design
+    matrix. Same solution for a full-rank design, and it returns the usual OLSResults, so
+    summary2, the robust F test and the dyadic covariance work unchanged.
+    """
+    X, y = mod.exog, mod.endog
+    k = X.shape[1]
+    XtX, Xty = np.zeros((k, k)), np.zeros(k)
+    for start in range(0, X.shape[0], chunk_size):
+        Xc = X[start:start + chunk_size].astype(np.float64)
+        XtX += Xc.T @ Xc
+        Xty += Xc.T @ y[start:start + chunk_size]
+    # what fit(method='pinv') sets on the model (rank also keeps statsmodels from running
+    # matrix_rank, another SVD of the full matrix, when it needs the degrees of freedom)
+    mod.normalized_cov_params = np.linalg.inv(XtX)
+    mod.wexog_singular_values = np.sqrt(
+        np.clip(np.linalg.eigvalsh(XtX), 0, None))
+    mod.rank = k
+    beta = np.linalg.solve(XtX, Xty)
+    return RegressionResultsWrapper(OLSResults(mod, beta, normalized_cov_params=mod.normalized_cov_params))
 
 # ===================================================================
 # EMBEDDING STORE
@@ -411,7 +482,7 @@ def dist_controlled_sampler(G, distr, total_count, avoid=None, batch_size=2_000_
     prev_filled = -1
     stall_rounds = 0
 
-    with tqdm(total=total_count, desc='Sampling non-edges (fast)', unit='edge', leave=False) as pbar:
+    with tqdm(total=total_count, desc='Sampling non-edges', unit='edge', leave=False) as pbar:
         while bin_filled.sum() < total_count:
             # bin_filled is a zero-array mirroring bin_quotas to be incremented and evaluated against it
             # this part repeats after each loop through the bins as long as the bins haven't been filled
@@ -627,6 +698,7 @@ def prepare_data(
         # in train run short, so one shared distribution would offset the two sets in opposite ways
         # (precision keeps the bin labels exact: the sampler reads its bin edges back off them, and
         # the default 3 digits would shift each edge by up to ~0.4%)
+
         def distr(edges):
             return pd.cut(edges['DIST_KM'], bins=log_bins, include_lowest=True,
                           precision=10).value_counts().sort_index()
@@ -647,7 +719,8 @@ def prepare_data(
                     frame[f'{col}_{side}'] = attrs[col].values
             # same formula as the edges' DIST_KM (matches it to ~1e-6)
             frame['DIST_KM'] = haversine(
-                frame[f'LAT_{node_a}'].to_numpy(np.float64), frame[f'LNG_{node_a}'].to_numpy(np.float64),
+                frame[f'LAT_{node_a}'].to_numpy(
+                    np.float64), frame[f'LNG_{node_a}'].to_numpy(np.float64),
                 frame[f'LAT_{node_b}'].to_numpy(np.float64), frame[f'LNG_{node_b}'].to_numpy(np.float64)).astype(np.float32)
             # columns in the edges' order
             return frame[[c for c in edge_cols if c in frame.columns]]
@@ -1090,6 +1163,28 @@ def build_feature_matrix(
     return X, kept_indices, feature_names
 
 
+def _design_matrix(frames, *args, chunk_size=250_000, **kwargs):
+    """Feature matrix for the rows of `frames` (stacked in order) with a leading constant column.
+
+    Built chunk by chunk straight into one float32 array: build_feature_matrix on millions of
+    rows at once needs several times the matrix's size (the avg operator alone stacks both
+    endpoints' embedding blocks). Every row is kept. Arguments after `frames` go to
+    build_feature_matrix. Returns the matrix and its column names ('const' first).
+    """
+    X, names, row = None, None, 0
+    for edges in frames:
+        for lo in range(0, len(edges), chunk_size):
+            Xc, _, names = build_feature_matrix(
+                edges.iloc[lo:lo + chunk_size], *args, **kwargs)
+            if X is None:
+                X = np.empty(
+                    (sum(map(len, frames)), Xc.shape[1] + 1), dtype=np.float32)
+                X[:, 0] = 1.0
+            X[row:row + len(Xc), 1:] = Xc
+            row += len(Xc)
+    return X, ['const'] + names
+
+
 # ===================================================================
 # RUN_PIPELINE
 # ====================================================================
@@ -1224,6 +1319,8 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     # ensure training graph is fully connected
     G = nx.from_pandas_edgelist(train_edges, node_a, node_b)
     assert nx.is_connected(G), 'Error: disconnected training graph.'
+    # only needed for the check (~5 GB at poi scale if it stays around for the fit)
+    del G
 
     # ===== Embedding generation (only if needed) =====
 
@@ -1317,6 +1414,8 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         else:
             cats = sorted(pd.unique(pd.concat(
                 [train_pairs['TAXONOMY_ORIGIN'], train_pairs['TAXONOMY_DESTINATION']])))
+        # a full copy of the training pairs (~2 GB at poi scale); don't keep it through the fit
+        del train_pairs
 
     log_densities = None
     if 'density' in features:
@@ -1330,19 +1429,19 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
         #     add_outside_metadata(G)
 
     _log_mem("before building train feature matrices")
-    X_train_pos, keep_train_pos, feature_names = build_feature_matrix(
-        train_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, log_densities)
-    _log_mem("after X_train_pos built")
-    X_train_neg, keep_train_neg, _ = build_feature_matrix(
-        train_non_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, log_densities)
-    _log_mem("after X_train_neg built")
-
-    X_train = np.vstack([X_train_pos, X_train_neg])
+    # float32 with the constant column built in: half the memory of float64, with the same values
+    # since build_feature_matrix already returns float32 (the statsmodels methods that would
+    # convert it to float64 wholesale are swapped for chunked versions at the top of this file)
+    fm_args = (features, embedding_map, operator, cat_threshold, agg,
+               z_score_stats, cats, log_densities)
+    X_train, exog_names = _design_matrix(
+        [train_edges, train_non_edges], *fm_args)
+    feature_names = exog_names[1:]
+    keep_train_pos = np.arange(len(train_edges))
+    keep_train_neg = np.arange(len(train_non_edges))
     y_train = np.concatenate([
-        np.ones(len(X_train_pos)),
-        np.zeros(len(X_train_neg))
+        np.ones(len(train_edges)),
+        np.zeros(len(train_non_edges))
     ])
 
     if standardize:
@@ -1371,28 +1470,12 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
             return train_set, train_mean, train_std
         X_train, train_mean, train_std = standardizer(X_train)
 
-    # convert Xs to df for feature names and standardization gates
-    X_train = pd.DataFrame(X_train, columns=feature_names)
-
-    # remove originals to save memory if no longer needed
-    if not strength:
-        del X_train_pos, X_train_neg
-    else:
-        del X_train_neg
-
     print(
-        f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
-    _log_mem("after training matrix assembled + originals freed")
+        f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1] - 1} features")
+    _log_mem("after training matrix assembled")
 
     # ===== Train =====
 
-    # add constant and fit model
-    X_train = sm.add_constant(X_train)
-    exog_names = ['const'] + feature_names
-
-    X_train = X_train.to_numpy(dtype=np.float64)
-    _log_mem(
-        "after add_constant + consolidating to ndarray, right before Logit(...) construction")
     link_mod = sm.Logit(y_train, X_train, check_rank=False)
     link_mod.data.xnames = exog_names
     _log_mem("after Logit(...) constructed, right before .fit()")
@@ -1436,20 +1519,18 @@ def run_pipeline_logistic(trainfile, train_edges, train_non_edges, test_edges, t
     else:
         print(link_model.summary2())
 
+    # the fitted model no longer needs the training matrix (run_sweep strips it anyway), so drop
+    # it before the test matrix is built and the two never sit in memory together
+    link_model.remove_data()
+    del X_train
+    _log_mem("after training matrix freed")
+
     # ===== Test =====
 
-    X_test_pos, keep_test_pos, _ = build_feature_matrix(
-        test_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, log_densities)
-    X_test_neg, _, _ = build_feature_matrix(
-        test_non_edges, features, embedding_map, operator, cat_threshold, agg,
-        z_score_stats, cats, log_densities)
-
-    X_test = np.vstack([X_test_pos, X_test_neg])
-    X_test = sm.add_constant(X_test, has_constant='add')
+    X_test, _ = _design_matrix([test_edges, test_non_edges], *fm_args)
     y_test = np.concatenate([
-        np.ones(len(X_test_pos)),
-        np.zeros(len(X_test_neg))
+        np.ones(len(test_edges)),
+        np.zeros(len(test_non_edges))
     ])
 
     if standardize:
@@ -1646,6 +1727,8 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     # ensure training graph is fully connected
     G = nx.from_pandas_edgelist(train, node_a, node_b)
     assert nx.is_connected(G), 'Error: disconnected training graph.'
+    # only needed for the check (~5 GB at poi scale if it stays around for the fit)
+    del G
 
     # ===== Embedding generation (only if needed) =====
 
@@ -1738,17 +1821,19 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
     if 'density' in features:
         log_densities = tract_log_densities(train, agg)
 
-    X_train, _, feature_names = build_feature_matrix(
-        train, features, embedding_map, operator,
-        agg=agg, z_score_stats=z_score_stats, cats=cats, log_densities=log_densities)
+    # float32 with the constant column built in (see run_pipeline_logistic)
+    fm_kwargs = dict(agg=agg, z_score_stats=z_score_stats,
+                     cats=cats, log_densities=log_densities)
+    X_train, exog_names = _design_matrix(
+        [train], features, embedding_map, operator, **fm_kwargs)
+    feature_names = exog_names[1:]
     if compressed:
         y_train = train['LOG_'+capweight]
     else:
         y_train = train[capweight]
 
-    X_test, _, _ = build_feature_matrix(
-        test, features, embedding_map, operator,
-        agg=agg, z_score_stats=z_score_stats, cats=cats, log_densities=log_densities)
+    X_test, _ = _design_matrix(
+        [test], features, embedding_map, operator, **fm_kwargs)
     if compressed:
         y_test = test['LOG_'+capweight]
     else:
@@ -1783,18 +1868,14 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
         X_test /= train_std
 
     print(
-        f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1]} features")
+        f"Training matrix: {X_train.shape[0]} samples x {X_train.shape[1] - 1} features")
 
     # ===== Train =====
-
-    # add constant and fit model
-    X_train = sm.add_constant(X_train)
-    exog_names = ['const'] + feature_names
 
     mod = sm.OLS(y_train, X_train)
     mod.data.xnames[:] = exog_names
 
-    model = mod.fit(method='pinv', maxiter=200)
+    model = _fit_ols(mod)
 
     # account for dependence between edges sharing nodes
     # node codes in X_train row order (build_feature_matrix keeps every row)
@@ -1833,7 +1914,6 @@ def run_pipeline_linear(trainfile, train, test, features, weight='cov', mode='Sp
 
     # === Test ===
 
-    X_test = sm.add_constant(X_test)
     y_pred = model.predict(X_test)
 
     rmse = root_mean_squared_error(y_test, y_pred)
