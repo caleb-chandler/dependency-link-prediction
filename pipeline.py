@@ -827,7 +827,7 @@ def tract_to_area(nodes, shapefile_paths=(
 
 
 def tract_log_densities(pos_edges, agg):
-    """log(POIs per km² of land) for every tract in the positive edges."""
+    """log(POIs per square km of land) for every tract in the positive edges."""
     if agg:
         # agg nodes are tract+category buckets, so sum their POI counts per tract
         nodes = pd.concat([
